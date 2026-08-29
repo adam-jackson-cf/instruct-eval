@@ -1,0 +1,2 @@
+dacdc3587682c04cf27e67c8878ca2d755230b6ad63c0c6ebddd7348ae90ed94  temporal_cli_1.8.2_darwin_arm64.tar.gz
+d8421bda989e6514b4bdb4d63a9012a8a05a806892e881a5aad8510496349a94  temporal_cli_1.8.2_linux_amd64.tar.gz

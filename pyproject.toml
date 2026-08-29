@@ -1,0 +1,70 @@
+[project]
+name = "instruct-eval"
+version = "0.1.0"
+requires-python = "==3.13.7"
+dependencies = [
+  "temporalio==1.32.0",
+  "rfc8785==0.1.4",
+  "cryptography==46.0.3",
+]
+
+[project.scripts]
+instruct-eval = "instruct_eval.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/instruct_eval"]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.19.0",
+    "pre-commit>=4.5.0",
+    "pytest>=9.0.0",
+    "ruff>=0.15.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "UP",
+    "B",
+    "SIM",
+    "RUF",
+    "W",
+    "C4",
+    "PT",
+    "PGH",
+    "A",
+    "D",
+    "N",
+    "C901",
+    "PLR0911",
+    "PLR0912",
+    "PLR0913",
+    "PLR0915",
+]
+ignore = ["D100", "D101", "D102", "D103", "D104", "D105", "D107"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+packages = ["instruct_eval"]
