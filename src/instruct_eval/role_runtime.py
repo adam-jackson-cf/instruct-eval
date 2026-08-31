@@ -804,14 +804,11 @@ def execute_omp(execution: OmpExecutionRequest) -> ExecutionResult:
     executable = _omp()
     profile = f"instruct-eval-{uuid.uuid4().hex}"
     runtime_version, native = _runtime_native(execution.request)
-    runtime_parent = (
-        execution.workspace.parent
-        if _EXPERIMENTS_ROOT in execution.workspace.parents
-        else _EXPERIMENTS_ROOT
-    )
+    inside_experiment = _EXPERIMENTS_ROOT in execution.workspace.parents
+    runtime_parent = execution.workspace.parent if inside_experiment else _EXPERIMENTS_ROOT
     runtime_parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
-        prefix=_experiment_prefix("runtime"),
+        prefix="runtime-" if inside_experiment else _experiment_prefix("runtime"),
         dir=runtime_parent,
     ) as temporary:
         root = Path(temporary)

@@ -161,7 +161,23 @@ class RoleRuntimeTest(unittest.TestCase):
                         False,
                     )
                 )
-            child_environment = popen.call_args.kwargs["env"]
+                external_environment = popen.call_args.kwargs["env"]
+                experiment = experiments / "20260831T142530.123456Z-subject-core-1-A-1-unique"
+                experiment_workspace = experiment / "workspace"
+                experiment_workspace.mkdir(parents=True)
+                credential.write_text("ephemeral")
+                runtime.execute_omp(
+                    runtime.OmpExecutionRequest(
+                        experiment_workspace,
+                        "prompt",
+                        self.request,
+                        "system",
+                        (),
+                        False,
+                    )
+                )
+                experiment_environment = popen.call_args.kwargs["env"]
+            child_environment = external_environment
             child_tmpdir = Path(child_environment["TMPDIR"])
             runtime_directory = child_tmpdir.parent
             assert runtime_directory.parent == experiments
@@ -170,6 +186,14 @@ class RoleRuntimeTest(unittest.TestCase):
                 runtime_directory.name,
             )
             assert not runtime_directory.exists()
+            experiment_tmpdir = Path(experiment_environment["TMPDIR"])
+            experiment_runtime_directory = experiment_tmpdir.parent
+            assert experiment_runtime_directory.parent == experiment
+            assert re.fullmatch(
+                r"runtime-[A-Za-z0-9_-]+",
+                experiment_runtime_directory.name,
+            )
+            assert not experiment_runtime_directory.exists()
 
     def test_snapshot_and_diff_include_empty_directories_and_file_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
