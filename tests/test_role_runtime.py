@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import stat
 import tempfile
 import unittest
@@ -33,6 +34,22 @@ class RoleRuntimeTest(unittest.TestCase):
                 "tools": ["read", "edit", "write", "glob", "grep"],
             },
         }
+
+    def assert_timestamped_workspace(
+        self,
+        workspace: Path,
+        experiments: Path,
+        kind: str,
+        identity: str,
+    ) -> Path:
+        assert workspace.name == "workspace"
+        experiment = workspace.parent
+        assert experiment.parent == experiments
+        assert re.fullmatch(
+            rf"\d{{8}}T\d{{6}}\.\d{{6}}Z-{kind}-{identity}-[A-Za-z0-9_-]+",
+            experiment.name,
+        )
+        return experiment
 
     def test_credential_gateway_receives_only_isolated_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -102,6 +119,57 @@ class RoleRuntimeTest(unittest.TestCase):
         assert str(binary) in profile
         assert 'network-outbound (remote ip "localhost:*")' in profile
         assert 'subpath "/Users' not in profile
+
+    def test_execute_omp_places_child_tmpdir_under_project_experiments(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            experiments = root / "experiments"
+            workspace = root / "external-workspace"
+            workspace.mkdir()
+            native = root / "native"
+            native.write_text("runtime")
+            credential = root / "credential"
+            credential.write_text("ephemeral")
+            child = MagicMock(returncode=0)
+            child.communicate.return_value = ('{"type":"agent_end"}\n', "")
+            gateway = runtime._Gateway(
+                MagicMock(),
+                MagicMock(),
+                "http://127.0.0.1:1",
+                "client-token",
+                credential,
+            )
+            with (
+                patch.object(runtime, "_EXPERIMENTS_ROOT", experiments),
+                patch.object(runtime, "_omp", return_value=Path("/bin/echo")),
+                patch.object(
+                    runtime,
+                    "_runtime_native",
+                    return_value=("18.0.1", native),
+                ),
+                patch.object(runtime, "_start_gateway", return_value=gateway),
+                patch.object(runtime, "_sandbox", return_value=["omp"]),
+                patch.object(runtime.subprocess, "Popen", return_value=child) as popen,
+            ):
+                runtime.execute_omp(
+                    runtime.OmpExecutionRequest(
+                        workspace,
+                        "prompt",
+                        self.request,
+                        "system",
+                        (),
+                        False,
+                    )
+                )
+            child_environment = popen.call_args.kwargs["env"]
+            child_tmpdir = Path(child_environment["TMPDIR"])
+            runtime_directory = child_tmpdir.parent
+            assert runtime_directory.parent == experiments
+            assert re.fullmatch(
+                r"\d{8}T\d{6}\.\d{6}Z-runtime-[A-Za-z0-9_-]+",
+                runtime_directory.name,
+            )
+            assert not runtime_directory.exists()
 
     def test_snapshot_and_diff_include_empty_directories_and_file_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -203,8 +271,26 @@ class RoleRuntimeTest(unittest.TestCase):
 
     def test_witness_execution_uses_clean_frozen_fixture_and_complete_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture, witness = self._witness_fixture(Path(temporary) / "fixture")
-            result = runtime.run_witness(fixture, witness, Path(temporary) / "fixture")
+            root = Path(temporary)
+            experiments = root / "experiments"
+            fixture, witness = self._witness_fixture(root / "fixture")
+            with (
+                patch.object(runtime, "_EXPERIMENTS_ROOT", experiments),
+                patch.object(
+                    runtime,
+                    "_run_witness_commands",
+                    wraps=runtime._run_witness_commands,
+                ) as commands,
+            ):
+                result = runtime.run_witness(fixture, witness, root / "fixture")
+            workspace = commands.call_args.args[1]
+            experiment = self.assert_timestamped_workspace(
+                workspace,
+                experiments,
+                "witness",
+                witness.witness_id,
+            )
+            assert not experiment.exists()
         assert result.protocol_valid
         assert not result.contaminated
         assert result.verifier_passed
@@ -309,20 +395,38 @@ class RoleRuntimeTest(unittest.TestCase):
 
     def test_subject_rejects_modified_verifier_or_observer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            fixture = Path(temporary) / "fixture"
+            root = Path(temporary)
+            experiments = root / "experiments"
+            fixture = root / "fixture"
             fixture.mkdir()
             (fixture / "TASK.txt").write_text("task")
             (fixture / "verify.py").write_text("raise SystemExit(0)\n")
             (fixture / "observer.py").write_text("raise SystemExit(0)\n")
+            workspaces: list[Path] = []
 
             def mutate(execution: runtime.OmpExecutionRequest) -> runtime.ExecutionResult:
+                workspaces.append(execution.workspace)
                 (execution.workspace / "verify.py").write_text("changed")
                 return runtime.ExecutionResult("done", None, ())
 
-            with patch.object(runtime, "execute_omp", side_effect=mutate):
+            with (
+                patch.object(runtime, "_EXPERIMENTS_ROOT", experiments),
+                patch.object(runtime, "execute_omp", side_effect=mutate),
+            ):
                 result = runtime.run_subject(
-                    "core-1-A-1", "A", fixture, self.request, observer_paths=("observer.py",)
+                    "core-1-A-1",
+                    "A",
+                    fixture,
+                    self.request,
+                    observer_paths=("observer.py",),
                 )
+            experiment = self.assert_timestamped_workspace(
+                workspaces[0],
+                experiments,
+                "subject",
+                "core-1-A-1",
+            )
+            assert not experiment.exists()
         assert not result.protocol_valid
         assert not result.verifier_passed
         assert result.reason == "public verifier or observer was modified"
@@ -403,22 +507,41 @@ class RoleRuntimeTest(unittest.TestCase):
         assert result.reason == "subject execution failed: OMP JSON stream is malformed"
 
     def test_role_packet_does_not_include_private_request_data(self) -> None:
-        captured: dict[str, str] = {}
+        captured: dict[str, str | Path] = {}
         with tempfile.TemporaryDirectory() as temporary:
-            contract = Path(temporary) / "role.md"
+            root = Path(temporary)
+            experiments = root / "experiments"
+            contract = root / "role.md"
             contract.write_text("contract")
 
             def execute(execution: runtime.OmpExecutionRequest) -> runtime.ExecutionResult:
                 captured["prompt"] = execution.prompt
                 captured["system"] = execution.system_prompt
+                captured["workspace"] = execution.workspace
                 return runtime.ExecutionResult('{"approved":true}', {"approved": True}, ())
 
             private_request = {**self.request, "private_maps": {"join": "do-not-leak"}}
-            with patch.object(runtime, "execute_omp", side_effect=execute):
+            with (
+                patch.object(runtime, "_EXPERIMENTS_ROOT", experiments),
+                patch.object(runtime, "execute_omp", side_effect=execute),
+            ):
                 result = runtime.invoke_role(contract, {"public": "packet"}, private_request)
+            workspace = captured["workspace"]
+            assert isinstance(workspace, Path)
+            experiment = self.assert_timestamped_workspace(
+                workspace,
+                experiments,
+                "role",
+                "role",
+            )
+            assert not experiment.exists()
         assert dict(result) == {"approved": True}
-        assert "do-not-leak" not in captured["prompt"]
-        assert "do-not-leak" not in captured["system"]
+        prompt = captured["prompt"]
+        system_prompt = captured["system"]
+        assert isinstance(prompt, str)
+        assert isinstance(system_prompt, str)
+        assert "do-not-leak" not in prompt
+        assert "do-not-leak" not in system_prompt
 
 
 if __name__ == "__main__":

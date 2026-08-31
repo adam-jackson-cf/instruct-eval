@@ -6,6 +6,7 @@ import contextlib
 import difflib
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -13,8 +14,9 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -43,6 +45,24 @@ _SYSTEM_READS = (
 _MAX_EVIDENCE_BYTES = 2 << 20
 _MAX_STREAM_BYTES = 1 << 20
 _MAX_RESULT_TEXT_BYTES = 1 << 18
+_EXPERIMENTS_ROOT = Path(__file__).parents[2] / "experiments"
+
+
+def _experiment_prefix(kind: str, identity: str = "") -> str:
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+    safe_identity = re.sub(r"[^A-Za-z0-9._-]+", "-", identity).strip("._-")[:64]
+    identity_segment = f"-{safe_identity}" if safe_identity else ""
+    return f"{timestamp}-{kind}{identity_segment}-"
+
+
+@contextlib.contextmanager
+def _experiment_directory(kind: str, identity: str = "") -> Generator[Path]:
+    _EXPERIMENTS_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=_experiment_prefix(kind, identity),
+        dir=_EXPERIMENTS_ROOT,
+    ) as temporary:
+        yield Path(temporary)
 
 
 class RoleRuntimeError(ProtocolError):
@@ -784,7 +804,16 @@ def execute_omp(execution: OmpExecutionRequest) -> ExecutionResult:
     executable = _omp()
     profile = f"instruct-eval-{uuid.uuid4().hex}"
     runtime_version, native = _runtime_native(execution.request)
-    with tempfile.TemporaryDirectory(prefix="instruct-eval-runtime-") as temporary:
+    runtime_parent = (
+        execution.workspace.parent
+        if _EXPERIMENTS_ROOT in execution.workspace.parents
+        else _EXPERIMENTS_ROOT
+    )
+    runtime_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=_experiment_prefix("runtime"),
+        dir=runtime_parent,
+    ) as temporary:
         root = Path(temporary)
         home = _prepare_runtime_home(root, profile)
         destination = home / ".omp" / "natives" / runtime_version / native.name
@@ -859,10 +888,12 @@ def invoke_role(
         + "\n\nThe supplied packet is complete. Return one JSON object now; do not ask "
         "for more data, describe your reasoning, or use a code fence."
     )
-    with tempfile.TemporaryDirectory(prefix="instruct-eval-role-") as temporary:
+    with _experiment_directory("role", contract.stem) as experiment:
+        workspace = experiment / "workspace"
+        workspace.mkdir()
         result = execute_omp(
             OmpExecutionRequest(
-                Path(temporary),
+                workspace,
                 prompt,
                 request,
                 system_prompt,
@@ -1153,10 +1184,8 @@ def run_witness(
     """Execute one condition-independent witness against a clean frozen fixture."""
     contract = _witness_contract(fixture)
     changes = _witness_changes(witness)
-    with tempfile.TemporaryDirectory(
-        prefix=f"instruct-eval-witness-{witness.witness_id}-"
-    ) as temporary:
-        workspace = Path(temporary) / "workspace"
+    with _experiment_directory("witness", witness.witness_id) as experiment:
+        workspace = experiment / "workspace"
         shutil.copytree(fixture_root, workspace, symlinks=True)
         before = snapshot_workspace(workspace)
         _validate_frozen_fixture(before, fixture, contract)
@@ -1499,8 +1528,8 @@ def run_subject(
     if condition not in {"A", "B"}:
         raise RoleRuntimeError("subject condition is invalid")
     subject = _SubjectRequest(assignment, condition, fixture, request, observer_paths)
-    with tempfile.TemporaryDirectory(prefix=f"instruct-eval-{assignment}-") as temporary:
-        workspace = Path(temporary) / "workspace"
+    with _experiment_directory("subject", assignment) as experiment:
+        workspace = experiment / "workspace"
         shutil.copytree(subject.fixture, workspace, symlinks=True)
         prepared = _prepare_subject_run(workspace, subject)
         if isinstance(prepared, SubjectResult):

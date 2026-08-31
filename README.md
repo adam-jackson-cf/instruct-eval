@@ -51,6 +51,14 @@ one adversary decision for the exact packet.
 
 Private roots and SQLite state must remain outside campaign artifact directories. Published public evidence is read from `artifact_root`; private roots and databases are not inspection inputs.
 
+## Evaluation workspaces
+
+Each subject, witness, and internal role evaluation creates an isolated workspace below the
+repository-root `experiments/` directory. Evaluation directory names begin with a UTC timestamp and
+the evaluation kind, for example `20260831T142530.123456Z-subject-core-1-A-1-<unique>/workspace`.
+The isolated OMP runtime and its `TMPDIR` remain within that evaluation directory. Evaluation
+directories are removed when execution completes, and `experiments/` is excluded from Git.
+
 ## Recovery and quality
 
 Restart verification relaunches both unchanged worker-mode commands, then queries campaign `status`. Temporal replays workflow history during recovery; this package exposes no separate production replay command.
