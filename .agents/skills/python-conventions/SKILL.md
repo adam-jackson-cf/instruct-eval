@@ -1,4 +1,3 @@
-```markdown
 ---
 name: "python-conventions"
 description: "Guide Python naming, package structure, and code-object choices. USE WHEN writing or refactoring Python code."
@@ -30,5 +29,3 @@ Complements Ruff `pep8-naming`; does not replace deterministic lint checks.
 - Use a Protocol for structural contracts across implementations.
 - Use an Enum for a closed symbolic set.
 - Do not create a god class to centralize unrelated workflows.
-
-```
