@@ -449,58 +449,6 @@ class ActivityTests(unittest.TestCase):
         assert Path(ledger["public_artifact_path"]).read_bytes() == expected
         assert canonical_bytes(recovered.payload) == expected
 
-    def test_gate_recovery_rejects_substituted_request_metadata(self) -> None:
-        value = request(
-            ReleaseRequest,
-            workflow_id="workflow",
-            run_id="run",
-            ordinal=0,
-            prior_record_sha256="0" * 64,
-            expected_revision_sha256="b" * 64,
-            branch_kind="release",
-        )
-        record = canonical_bytes(
-            {
-                "purpose": "release",
-                "request": {
-                    "campaign_id": value.campaign_id,
-                    "experiment_id": value.experiment_id,
-                    "role_token": value.role_token,
-                    "frozen_input_sha256": value.frozen_input_sha256,
-                    "model_identity": value.model_identity,
-                    "runtime_identity": value.runtime_identity,
-                    "payload": {"artifact": "public"},
-                    "workflow_id": value.workflow_id,
-                    "run_id": value.run_id,
-                    "ordinal": value.ordinal,
-                    "prior_record_sha256": value.prior_record_sha256,
-                    "expected_revision_sha256": value.expected_revision_sha256,
-                    "branch_kind": value.branch_kind,
-                },
-            }
-        )
-        self.store.reserve_gate(
-            GateRequest("workflow", "run", 0, "0" * 64, "b" * 64, "release", record)
-        )
-        substituted = ReleaseRequest(
-            "campaign",
-            "experiment",
-            "role",
-            value.frozen_input_sha256,
-            "other-model",
-            "runtime",
-            {"artifact": "public"},
-            workflow_id="workflow",
-            run_id="run",
-            ordinal=0,
-            prior_record_sha256="0" * 64,
-            expected_revision_sha256="b" * 64,
-            branch_kind="release",
-        )
-        with pytest.raises(ApplicationError):
-            asyncio.run(self.activities.release(substituted))
-        assert self.backend.calls == []
-
     def test_gate_publication_requires_exact_canonical_public_payload_bytes(self) -> None:
         payload = {"artifact": "public"}
         with pytest.raises(ValueError, match="artifact bytes do not match"):

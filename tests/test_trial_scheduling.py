@@ -88,7 +88,7 @@ class TrialSchedulingTests(unittest.TestCase):
             dispatcher.terminal(assignment, "result")
         assert len(dispatcher.dispatch()) == 4
 
-    def test_metadata_rejects_untrusted_or_wrong_chain(self):
+    def test_metadata_rejects_untrusted_namespace(self):
         with pytest.raises(TrialProtocolError):
             trusted_activity_metadata(
                 TrustedActivityMetadataParams(
@@ -99,11 +99,26 @@ class TrialSchedulingTests(unittest.TestCase):
                     expected_activity_id="prepare",
                     verified_parent_workflow_id="parent",
                     verified_parent_run_id="parent-run",
-                    freeze_chain="f",
+                    freeze_chain="f" * 64,
                 )
             )
 
-    def test_sqlite_restart_concurrent_stability_permissions_and_lifecycle(self):
+    def test_metadata_rejects_missing_freeze_chain(self):
+        with pytest.raises(TrialProtocolError):
+            trusted_activity_metadata(
+                TrustedActivityMetadataParams(
+                    info=Info(),
+                    expected_namespace="default",
+                    expected_activity_type="PreparePrivateMap",
+                    expected_task_queue="queue",
+                    expected_activity_id="prepare",
+                    verified_parent_workflow_id="parent",
+                    verified_parent_run_id="parent-run",
+                    freeze_chain="",
+                )
+            )
+
+    def test_sqlite_restart_stability_permissions_and_lifecycle(self):
         with tempfile.TemporaryDirectory() as tmp, warnings.catch_warnings():
             warnings.simplefilter("error", ResourceWarning)
             db = Path(tmp) / "private.db"

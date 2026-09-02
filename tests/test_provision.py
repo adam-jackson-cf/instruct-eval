@@ -73,7 +73,7 @@ class ProvisionTests(unittest.TestCase):
             with self.subTest(content=content), pytest.raises(provision.ProvisionError):
                 provision.parse_checksums(path)
 
-    def test_https_downloader_rejects_partial_and_oversize_payloads(self) -> None:
+    def test_https_downloader_rejects_non_https_and_declared_oversize_payloads(self) -> None:
         class Response:
             def __init__(self) -> None:
                 self.headers = {"Content-Length": "99"}

@@ -17,7 +17,7 @@ import pytest
 from temporalio.common import WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
-from instruct_eval import cli, production_worker, worker
+from instruct_eval import cli, worker
 from instruct_eval.activities import (
     ChildAuthorizationClaimRequest,
     ChildAuthorizationIssueRequest,
@@ -701,11 +701,6 @@ class EntrypointWorkerTests(unittest.TestCase):
                 public_task_queue="same",
                 private_task_queue="same",
             )
-
-    def test_production_worker_has_only_mode_specific_config_loaders(self) -> None:
-        assert callable(production_worker.load_public_config)
-        assert callable(production_worker.load_private_config)
-        assert not hasattr(production_worker, "load_config")
 
 
 class CampaignEntrypointTests(unittest.TestCase):

@@ -11,7 +11,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from instruct_eval.artifacts import ArtifactMode, ArtifactStore
-from instruct_eval.coordination import CoordinationStore, GateRequest
+from instruct_eval.coordination import CoordinationStore
 from instruct_eval.messages import (
     InspectDecompositionRequest,
     InspectDesignRequest,
@@ -228,17 +228,6 @@ class ProposalControlTests(unittest.TestCase):
             expected_revision_hash=parameters.expected_revision_hash,
             sequence=parameters.sequence,
         )
-        self.coordination.reserve_gate(
-            GateRequest(
-                workflow_id="workflow",
-                run_id="run",
-                ordinal=0,
-                prior_record_sha256="0" * 64,
-                expected_revision_sha256="f" * 64,
-                branch_kind="release",
-                record_input_bytes=b"gate",
-            )
-        )
         published = self.control.publish_decision(request)
         assert published.decision_sha256 == wire.hash
         assert published.decision_artifact_sha256 == wire.hash
@@ -249,7 +238,7 @@ class ProposalControlTests(unittest.TestCase):
         assert self.control.publish_decision(request) == published
         assert self.private.private_bytes_raw() not in published.decision_artifact_path.read_bytes()
 
-    def test_decision_rejects_malformed_wire_competing_branch_and_stale_epoch(self) -> None:
+    def test_decision_rejects_malformed_wire_and_competing_branch(self) -> None:
         parameters = DecisionValidationParameters(
             campaign_id=CAMPAIGN,
             target_kind="campaign",

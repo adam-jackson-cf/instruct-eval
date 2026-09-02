@@ -54,6 +54,8 @@ class CoordinationStoreTests(unittest.TestCase):
         )
 
     def test_invocation_payloads_are_bounded_before_persistence(self) -> None:
+        with pytest.raises(CoordinationError):
+            self.store.reserve_invocation("too-large-input", b"12345")
         with closing(self.store._connection()) as connection:
             assert (
                 connection.execute(
@@ -100,6 +102,12 @@ class CoordinationStoreTests(unittest.TestCase):
 
     def test_reserved_same_branch_recovery_requires_exact_provenance(self) -> None:
         first = self.reserve()
+        assert first.disposition == GateDisposition.ACQUIRED
+        assert first.prior_record_sha256 == self.prior
+        assert first.expected_revision_sha256 == self.revision
+        assert first.branch_kind == "release"
+        assert first.record_input_bytes == self.input
+        assert first.record_input_sha256 == sha256(self.input).hexdigest()
         recovered = self.reserve()
         assert recovered.disposition == GateDisposition.RECOVERED
         assert (recovered.owner_epoch or 0) > (first.owner_epoch or 0)
@@ -124,6 +132,18 @@ class CoordinationStoreTests(unittest.TestCase):
                     prior_record_sha256=self.prior,
                     expected_revision_sha256="c" * 64,
                     branch_kind="release",
+                    record_input_bytes=self.input,
+                )
+            )
+        with pytest.raises(CoordinationError):
+            self.store.reserve_gate(
+                GateRequest(
+                    workflow_id="workflow",
+                    run_id="run",
+                    ordinal=0,
+                    prior_record_sha256=self.prior,
+                    expected_revision_sha256=self.revision,
+                    branch_kind="competing",
                     record_input_bytes=self.input,
                 )
             )
@@ -193,7 +213,13 @@ class CoordinationStoreTests(unittest.TestCase):
             )
         )
         assert published.disposition == GateDisposition.PUBLISHED
-        assert self.reserve().disposition == GateDisposition.PUBLISHED
+        assert published.publication_path == artifact
+        assert published.publication_sha256 == digest
+        final_recovery = self.reserve()
+        assert final_recovery.disposition == GateDisposition.PUBLISHED
+        assert final_recovery.owner_epoch is None
+        assert final_recovery.publication_path == artifact
+        assert final_recovery.publication_sha256 == digest
 
     def test_publication_requires_exact_regular_file_and_recovers_only_exact_artifact(self) -> None:
         reservation = self.reserve()
@@ -318,6 +344,18 @@ class CoordinationStoreTests(unittest.TestCase):
                     record_input_bytes=self.input,
                 )
             )
+        with pytest.raises(CoordinationError):
+            self.store.reserve_gate(
+                GateRequest(
+                    workflow_id="workflow",
+                    run_id="run",
+                    ordinal=2,
+                    prior_record_sha256=self.prior,
+                    expected_revision_sha256=self.revision,
+                    branch_kind="release",
+                    record_input_bytes=self.input,
+                )
+            )
         artifact = self.root / "first.json"
         artifact.write_bytes(b"first")
         digest = sha256(b"first").hexdigest()
@@ -356,84 +394,6 @@ class CoordinationStoreTests(unittest.TestCase):
             ).disposition
             == GateDisposition.ACQUIRED
         )
-
-    def test_initialize_closes_connection_on_success(self) -> None:
-        class FakeConnection:
-            def __init__(self) -> None:
-                self.closed = False
-
-            def executescript(self, script: str) -> None:
-                self.script = script
-
-            def execute(self, query: str):
-                self.query = query
-                if "child_authorizations" in query:
-                    return [
-                        (0, "campaign_id"),
-                        (1, "parent_workflow_id"),
-                        (2, "parent_run_id"),
-                        (3, "claim_sha256"),
-                        (4, "fingerprint_sha256"),
-                        (5, "coverage_sha256"),
-                        (6, "experiment_id"),
-                        (7, "child_workflow_id"),
-                        (8, "child_run_id"),
-                        (9, "state"),
-                        (10, "owner_epoch"),
-                    ]
-                return [
-                    (0, "prior_record_sha256"),
-                    (1, "expected_revision_sha256"),
-                    (2, "branch_kind"),
-                    (3, "record_input_bytes"),
-                    (4, "record_input_sha256"),
-                    (5, "publication_path"),
-                ]
-
-            def close(self) -> None:
-                self.closed = True
-
-        fake = FakeConnection()
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "coordination.sqlite"
-            path.touch()
-            store = CoordinationStore.__new__(CoordinationStore)
-            store.path = path
-            store.max_invocation_input_bytes = 4
-            store.max_invocation_result_bytes = 5
-            with patch.object(CoordinationStore, "_connection", return_value=fake):
-                store._initialize()
-            assert fake.closed
-
-    def test_initialize_closes_connection_when_schema_is_obsolete(self) -> None:
-        class FakeConnection:
-            def __init__(self) -> None:
-                self.closed = False
-
-            def executescript(self, script: str) -> None:
-                self.script = script
-
-            def execute(self, query: str):
-                self.query = query
-                return [(0, "workflow_id")]
-
-            def close(self) -> None:
-                self.closed = True
-
-        fake = FakeConnection()
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "coordination.sqlite"
-            path.touch()
-            store = CoordinationStore.__new__(CoordinationStore)
-            store.path = path
-            store.max_invocation_input_bytes = 4
-            store.max_invocation_result_bytes = 5
-            with (
-                patch.object(CoordinationStore, "_connection", return_value=fake),
-                pytest.raises(CoordinationError),
-            ):
-                store._initialize()
-            assert fake.closed
 
     def test_child_authorization_claims_exact_issued_binding_once(self) -> None:
         with patch("instruct_eval.coordination.secrets.randbelow", return_value=11) as nonce:

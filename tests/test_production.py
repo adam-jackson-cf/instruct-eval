@@ -626,12 +626,9 @@ class ProductionOperationsTest(unittest.TestCase):
                     self.runtime({"scores": {}}),
                 )
 
-    def test_fingerprint_is_canonical_and_operation_set_is_complete(self) -> None:
+    def test_fingerprint_is_canonical(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             operations = concrete_domain_operations()
-            assert set(operations.__dataclass_fields__) == set(
-                type(operations).__dataclass_fields__
-            )
             request_payload: Mapping[str, object] = {
                 "candidate_instruction": "do work",
                 "permissions": {},

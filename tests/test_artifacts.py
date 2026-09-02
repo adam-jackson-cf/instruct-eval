@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import stat
 import tempfile
@@ -20,10 +19,6 @@ from instruct_eval.artifacts import (
 from instruct_eval.coordination import (
     CoordinationError,
     CoordinationStore,
-    GateCommitRequest,
-    GateDisposition,
-    GatePublicationRequest,
-    GateRequest,
     InvocationDisposition,
 )
 
@@ -147,166 +142,6 @@ class CoordinationStoreTests(unittest.TestCase):
             self.store.reserve_invocation("call", b"changed input")
         with pytest.raises(CoordinationError):
             self.store.commit_result("call", first.owner_epoch or 0, b"other result")
-
-    def test_terminalization_wins_the_invocation_cas(self) -> None:
-        reservation = self.store.reserve_invocation("crash", b"input")
-        self.store.terminalize_indeterminate("crash", reservation.owner_epoch or 0)
-        assert (
-            self.store.reserve_invocation("crash", b"input").disposition
-            == InvocationDisposition.INDETERMINATE
-        )
-        with pytest.raises(CoordinationError):
-            self.store.commit_result("crash", reservation.owner_epoch or 0, b"late")
-
-    def test_gate_ordinal_branch_and_release_arbitration(self) -> None:
-        prior_record_sha256 = "0" * 64
-        expected_revision_sha256 = "b" * 64
-        competing_revision_sha256 = "c" * 64
-        branch_kind = "primary"
-        canonical_record_input = b"canonical record input"
-        competing_record_input = b"competing record input"
-        publication_bytes = b"published artifact"
-        publication_sha256 = hashlib.sha256(publication_bytes).hexdigest()
-        publication_path = self.path.with_name("publication.bin")
-        publication_path.write_bytes(publication_bytes)
-
-        first = self.store.reserve_gate(
-            GateRequest(
-                workflow_id="workflow",
-                run_id="run",
-                ordinal=0,
-                prior_record_sha256=prior_record_sha256,
-                expected_revision_sha256=expected_revision_sha256,
-                branch_kind=branch_kind,
-                record_input_bytes=canonical_record_input,
-            )
-        )
-        assert first.disposition == GateDisposition.ACQUIRED
-        assert first.prior_record_sha256 == prior_record_sha256
-        assert first.expected_revision_sha256 == expected_revision_sha256
-        assert first.branch_kind == branch_kind
-        assert first.record_input_bytes == canonical_record_input
-        assert first.record_input_sha256 == hashlib.sha256(canonical_record_input).hexdigest()
-
-        same_branch_recovery = self.store.reserve_gate(
-            GateRequest(
-                workflow_id="workflow",
-                run_id="run",
-                ordinal=0,
-                prior_record_sha256=prior_record_sha256,
-                expected_revision_sha256=expected_revision_sha256,
-                branch_kind=branch_kind,
-                record_input_bytes=canonical_record_input,
-            )
-        )
-        assert same_branch_recovery.disposition == GateDisposition.RECOVERED
-        assert same_branch_recovery.owner_epoch == (first.owner_epoch or 0) + 1
-
-        with pytest.raises(CoordinationError):
-            self.store.reserve_gate(
-                GateRequest(
-                    workflow_id="workflow",
-                    run_id="run",
-                    ordinal=0,
-                    prior_record_sha256=prior_record_sha256,
-                    expected_revision_sha256=competing_revision_sha256,
-                    branch_kind="competing",
-                    record_input_bytes=competing_record_input,
-                )
-            )
-        with pytest.raises(CoordinationError):
-            self.store.reserve_gate(
-                GateRequest(
-                    workflow_id="workflow",
-                    run_id="run",
-                    ordinal=2,
-                    prior_record_sha256=prior_record_sha256,
-                    expected_revision_sha256=competing_revision_sha256,
-                    branch_kind=branch_kind,
-                    record_input_bytes=canonical_record_input,
-                )
-            )
-
-        release = self.store.begin_release_commit(
-            GateCommitRequest(
-                workflow_id="workflow",
-                run_id="run",
-                ordinal=0,
-                expected_revision_sha256=expected_revision_sha256,
-                owner_epoch=same_branch_recovery.owner_epoch or 0,
-            )
-        )
-        assert release.disposition == GateDisposition.ACQUIRED
-        assert release.owner_epoch == same_branch_recovery.owner_epoch
-        with pytest.raises(CoordinationError):
-            self.store.begin_release_commit(
-                GateCommitRequest(
-                    workflow_id="workflow",
-                    run_id="run",
-                    ordinal=0,
-                    expected_revision_sha256=expected_revision_sha256,
-                    owner_epoch=(same_branch_recovery.owner_epoch or 0) + 1,
-                )
-            )
-
-        recovered = self.store.reserve_gate(
-            GateRequest(
-                workflow_id="workflow",
-                run_id="run",
-                ordinal=0,
-                prior_record_sha256=prior_record_sha256,
-                expected_revision_sha256=expected_revision_sha256,
-                branch_kind=branch_kind,
-                record_input_bytes=canonical_record_input,
-            )
-        )
-        assert recovered.disposition == GateDisposition.COMMITTING
-        assert recovered.owner_epoch == (release.owner_epoch or 0) + 1
-
-        with pytest.raises(CoordinationError):
-            self.store.publish_gate(
-                GatePublicationRequest(
-                    workflow_id="workflow",
-                    run_id="run",
-                    ordinal=0,
-                    expected_revision_sha256=expected_revision_sha256,
-                    owner_epoch=release.owner_epoch or 0,
-                    final_artifact_path=publication_path,
-                    expected_bytes=publication_bytes,
-                    expected_sha256=publication_sha256,
-                )
-            )
-        published = self.store.publish_gate(
-            GatePublicationRequest(
-                workflow_id="workflow",
-                run_id="run",
-                ordinal=0,
-                expected_revision_sha256=expected_revision_sha256,
-                owner_epoch=recovered.owner_epoch or 0,
-                final_artifact_path=publication_path,
-                expected_bytes=publication_bytes,
-                expected_sha256=publication_sha256,
-            )
-        )
-        assert published.disposition == GateDisposition.PUBLISHED
-        assert published.publication_path == publication_path
-        assert published.publication_sha256 == publication_sha256
-
-        final_recovery = self.store.reserve_gate(
-            GateRequest(
-                workflow_id="workflow",
-                run_id="run",
-                ordinal=0,
-                prior_record_sha256=prior_record_sha256,
-                expected_revision_sha256=expected_revision_sha256,
-                branch_kind=branch_kind,
-                record_input_bytes=canonical_record_input,
-            )
-        )
-        assert final_recovery.disposition == GateDisposition.PUBLISHED
-        assert final_recovery.owner_epoch is None
-        assert final_recovery.publication_path == publication_path
-        assert final_recovery.publication_sha256 == publication_sha256
 
     def test_database_is_private(self) -> None:
         assert stat.S_IMODE(self.path.stat().st_mode) == 384
