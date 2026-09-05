@@ -40,8 +40,9 @@ Public and private work are separated:
 
 See [workflow lifecycle](references/gate-transitions.md),
 [signed design package](references/design-package.md),
-[artifact layout](references/artifact-layout.md), and
-[artifact routing](references/artifact-routing.md) for the canonical contracts.
+[artifact layout](references/artifact-layout.md),
+[artifact routing](references/artifact-routing.md), and
+[evaluation result reporting](references/result-reporting.md) for the canonical contracts.
 
 ## How to use it
 
@@ -178,6 +179,10 @@ from Git.
 To recover an interrupted campaign, restart the same Temporal service and unchanged public and
 private worker commands, then query the original workflow ID. Temporal resumes from workflow
 history; there is no separate production replay command.
+
+After G5 release and the G6 terminal result, format the released public evidence with the
+[evaluation result reporting contract](references/result-reporting.md). Reporting explains the
+recorded result; it does not rescore outcomes or create a new authorization decision.
 
 ## Developer guidance
 

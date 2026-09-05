@@ -7,8 +7,9 @@
 - `AGENTS.md` defines developer guidance, implementation invariants, experiment workflow rules, and
   repository verification.
 - `references/gate-transitions.md`, `references/design-package.md`,
-  `references/artifact-layout.md`, and `references/artifact-routing.md` are the canonical workflow,
-  design, and boundary contracts.
+  `references/artifact-layout.md`, `references/artifact-routing.md`, and
+  `references/result-reporting.md` are the canonical workflow, design, boundary, and reporting
+  contracts.
 - `references/roles/` contains production runtime role contracts. Do not treat those files as
   operator documentation or move them without updating their production loader.
 - Keep each concept in its owning document. Link to canonical text instead of establishing a second
@@ -115,7 +116,19 @@ replay path.
 - Read: [artifact layout](references/artifact-layout.md),
   [artifact routing](references/artifact-routing.md), and
   [Temporal campaign lifecycle](references/gate-transitions.md).
-- Exit: the evidence supports a bounded result or the unresolved prerequisite is reported.
+- Exit: the terminal workflow status and released public evidence are available, or the unresolved
+  recovery prerequisite is reported.
+
+### Step 9: Report the released result
+
+Translate the terminal protocol result and released public evidence into a decision-ready report
+without rescoring outcomes or changing the G6 result.
+
+- Read: [evaluation result reporting](references/result-reporting.md),
+  [artifact layout](references/artifact-layout.md), and
+  [evidence/statistical analyst](references/roles/evidence-statistical-analyst.md).
+- Exit: the report leads with the bounded decision, distinguishes observation from inference, and
+  states both supported behavior and scope limitations.
 
 ## Reference use rules
 
