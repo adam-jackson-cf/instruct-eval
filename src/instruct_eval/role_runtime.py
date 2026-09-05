@@ -1524,7 +1524,20 @@ def run_subject(
     """Run a fresh subject and unchanged public verifier/observers in its fixture."""
     if condition not in {"A", "B"}:
         raise RoleRuntimeError("subject condition is invalid")
-    subject = _SubjectRequest(assignment, condition, fixture, request, observer_paths)
+    isolated_request = dict(request)
+    if condition == "A":
+        isolated_request.pop("candidate_instruction", None)
+    else:
+        treatment = isolated_request.get("candidate_instruction")
+        if not isinstance(treatment, str) or not treatment:
+            raise RoleRuntimeError("treatment instruction is unavailable")
+    subject = _SubjectRequest(
+        assignment,
+        condition,
+        fixture,
+        isolated_request,
+        observer_paths,
+    )
     with _experiment_directory("subject", assignment) as experiment:
         workspace = experiment / "workspace"
         shutil.copytree(subject.fixture, workspace, symlinks=True)

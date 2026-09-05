@@ -417,6 +417,35 @@ class RoleRuntimeTest(unittest.TestCase):
         with pytest.raises(runtime.RoleRuntimeError, match="diff exceeds the evidence bound"):
             runtime.workspace_diff(before, after)
 
+    def test_subject_control_removes_treatment_from_runtime_request_and_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            experiments = root / "experiments"
+            fixture = root / "fixture"
+            fixture.mkdir()
+            (fixture / "TASK.txt").write_text("task")
+            (fixture / "verify.py").write_text("raise SystemExit(0)\n")
+            executions: list[runtime.OmpExecutionRequest] = []
+
+            def capture(execution: runtime.OmpExecutionRequest) -> runtime.ExecutionResult:
+                executions.append(execution)
+                return runtime.ExecutionResult("done", None, ())
+
+            with (
+                patch.object(runtime, "_EXPERIMENTS_ROOT", experiments),
+                patch.object(runtime, "execute_omp", side_effect=capture),
+            ):
+                runtime.run_subject("core-1-A-1", "A", fixture, self.request)
+                runtime.run_subject("core-1-B-1", "B", fixture, self.request)
+
+        control, treatment = executions
+        assert "candidate_instruction" not in control.request
+        assert control.prompt == "task"
+        assert treatment.request["candidate_instruction"] == "private treatment"
+        assert treatment.prompt.endswith(
+            "Apply this additional instruction while completing the task:\nprivate treatment"
+        )
+
     def test_subject_rejects_modified_verifier_or_observer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
