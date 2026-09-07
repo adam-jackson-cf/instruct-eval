@@ -15,12 +15,18 @@ map, subject response, or score.
 
 Independently attack each fixture package and the complete design as submitted. Confirm that each
 package owns all of its fields; its source classification is true to semantic ownership and sharing;
-treatment slices are claim-specific; and its declared evidence can distinguish every fixture-local
-direction. Confirm every table is finite, total, exclusive, and reachable. Treat the coordinator's
-actual unchanged-verifier result as the only authoritative `verifier_passed` Boolean. Protocol
-validity is separate from that outcome: an unchanged verifier failure may be valid behavioral
-evidence, while verifier or observer modification, unavailable evidence, contamination, mismatched
-expected hashes, or an invalid observer object is invalid.
+treatment slices are claim-specific; `core-1` and `core-2` tasks are ordinary,
+condition-independent tasks that naturally trigger the tested behavior, while the
+`negative-control` task is ordinary, condition-independent, and genuinely non-triggering for it.
+No task may hint at or prescribe the treatment or add unrelated style, exception-handling,
+architecture, or other observer-convenience restrictions; its declared evidence can distinguish
+subject actions from coordinator verification, and, when timing is
+relevant, establishes whether subject actions occurred after final edits. Confirm every table is
+finite, total, exclusive, and reachable. Treat the coordinator's actual unchanged-verifier result
+as the only authoritative `verifier_passed` Boolean. Protocol validity is separate from that
+outcome: an unchanged verifier failure may be valid behavioral evidence, while verifier or observer
+modification, unavailable evidence, contamination, mismatched expected hashes, or an invalid
+observer object is invalid.
 
 Return exactly one JSON object and no markdown:
 
@@ -53,15 +59,21 @@ It is not a request for generic adversarial generation. When a material defect e
 canonical review packet"}, "rejections": ["short concrete evidence-backed defect"], "stress_review":
 null}`. Reject ambiguous semantic directions or table assignment; false `claim_normative`,
 `shared_context`, or `non_normative` classification; a false source hash or incomplete partition;
-omitted, overlapping, foreign, or whole-compound treatment content; unavailable or unsupported
-evidence; observer-provided `verifier_passed` or extra observer keys; non-finite, non-total,
-duplicate, oversized, shared, cross-fixture, or unreachable tables; a direction without a
-fixture-local witness; expected verifier results that do not cover exactly the fixture's witnesses;
-witness output that does not match its expectation; a witness that cannot traverse the
-production-equivalent boundary; or invalid, contaminated, frozen-source-changing, path-escaping,
-symlink-escaping, decoder-escaping, resource-escaping, incomplete-diff, or hash-mismatched
-execution. Reject a proposed design containing any adversary decision, approval, rejection, decision
-slot, or review-packet hash; it cannot pre-approve itself or substitute different design bytes.
+omitted, overlapping, foreign, or whole-compound treatment content; a core task that is not
+ordinary, condition-independent, and naturally behavior-triggering; a negative-control task that is
+not ordinary, condition-independent, and genuinely non-triggering for that behavior; a task that
+hints at or prescribes the treatment, or adds unrelated style, exception-handling, architecture, or
+other observer-convenience restriction; quality-gate-specific restrictions added to every task;
+unavailable or unsupported evidence, including evidence unable to distinguish subject action from
+coordinator verification or, when relevant, timing after final edits; observer-provided
+`verifier_passed` or extra observer keys; non-finite, non-total, duplicate, oversized, shared,
+cross-fixture, or unreachable tables; a direction without a fixture-local witness; expected verifier
+results that do not cover exactly the fixture's witnesses; witness output that does not match its
+expectation; a witness that cannot traverse the production-equivalent boundary; or invalid,
+contaminated, frozen-source-changing, path-escaping, symlink-escaping, decoder-escaping,
+resource-escaping, incomplete-diff, or hash-mismatched execution. Reject a proposed design
+containing any adversary decision, approval, rejection, decision slot, or review-packet hash; it
+cannot pre-approve itself or substitute different design bytes.
 Return exactly one separate `AdversaryDecision` for this supplied packet: its `accepted` value is
 this review's sole approval and its `packet_sha256` MUST equal the supplied canonical review-packet
 hash. The coordinator records that result immutably and MUST NOT feed it back into the design or

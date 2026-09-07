@@ -6,23 +6,26 @@ import asyncio
 import base64
 import contextlib
 import json
+import os
 import re
 import tempfile
+import threading
 import unittest
 from collections import Counter
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from uuid import uuid4
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from temporalio import activity, workflow
 from temporalio.api.common.v1 import WorkflowExecution
-from temporalio.client import WorkflowFailureError, WorkflowUpdateFailedError
+from temporalio.client import Client, WorkflowFailureError, WorkflowUpdateFailedError
 from temporalio.common import RetryPolicy
 from temporalio.converter import DataConverter
 from temporalio.exceptions import CancelledError
@@ -48,7 +51,7 @@ from instruct_eval.coordination import CoordinationStore
 from instruct_eval.messages import request_fingerprint
 from instruct_eval.models import canonical_bytes, canonical_hash
 from instruct_eval.signing import DecisionPayload, DecisionWire, public_key_base64url
-from instruct_eval.trials import authorization_rule
+from instruct_eval.trials import ASSIGNMENT_IDS, SUBJECT_ARTIFACT_KINDS, authorization_rule
 from instruct_eval.workflows import (
     CampaignInput,
     ExperimentCampaignWorkflow,
@@ -56,7 +59,7 @@ from instruct_eval.workflows import (
     WorkflowProtocolError,
 )
 
-CAMPAIGN_ID = "campaign-" + "1" * 32
+CAMPAIGN_ID = f"campaign-{uuid4().int % 10**32:032d}"
 COVERAGE = "2" * 64
 DESIGN = "3" * 64
 ZERO = "0" * 64
@@ -67,7 +70,7 @@ PRIVATE_QUEUE = "instruct-eval-private"
 
 @activity.defn
 async def timeout_probe_activity() -> None:
-    await asyncio.sleep(0.1)
+    await asyncio.Event().wait()
 
 
 @workflow.defn
@@ -76,7 +79,7 @@ class TimeoutProbeWorkflow:
     async def run(self) -> None:
         await workflow.execute_activity(
             timeout_probe_activity,
-            start_to_close_timeout=timedelta(milliseconds=10),
+            start_to_close_timeout=timedelta(seconds=1),
             retry_policy=RetryPolicy(maximum_attempts=1),
         )
 
@@ -216,18 +219,26 @@ class _ControlledBackend(worker.InstructEvalActivityBackend):
         }
     )
 
-    def __init__(self, root: Path, *, reject_g0: bool = False, reject_g2: bool = False) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        reject_g0: bool = False,
+        reject_g2: bool = False,
+        invalid_subject: bool = False,
+    ) -> None:
         self.calls: Counter[str] = Counter()
         self.packets: dict[str, list[Mapping[str, Any]]] = {}
         self.issued: list[Mapping[str, Any]] = []
         self.finalized_subjects: dict[str, str] = {}
-        self.tokens = tuple(f"{index:043d}" for index in range(10))
+        self.tokens = tuple(f"{index:043d}" for index in range(len(ASSIGNMENT_IDS)))
         self.active_subjects = self.max_active_subjects = 0
         self.describe_client = _DescribeClient()
         self.artifacts = ArtifactStore(root / "public", root / "private")
         self.coordination = CoordinationStore(root / "coordination.sqlite")
         self.private_maps = worker.PrivateMapLifecycle(root / "private.sqlite", root / "private")
         self.reject_g0, self.reject_g2 = reject_g0, reject_g2
+        self.invalid_subject = invalid_subject
         operations = worker.DomainOperations(
             **cast(
                 Any,
@@ -326,7 +337,7 @@ class _ControlledBackend(worker.InstructEvalActivityBackend):
 
     def _eligibility_payload(self, context: _OperationContext) -> Mapping[str, Any]:
         del context
-        return {"accepted": not self.reject_g0}
+        return {"eligible": not self.reject_g0}
 
     @staticmethod
     def _design_draft_payload(context: _OperationContext) -> Mapping[str, Any]:
@@ -446,17 +457,8 @@ class _ControlledBackend(worker.InstructEvalActivityBackend):
 
     async def release(self, request: ReleaseRequest) -> ReleasePublication:
         self._record("instruct_eval.release", request)
-        assignment_pairs = (
-            ("core-1", "A"),
-            ("core-1", "A"),
-            ("core-1", "B"),
-            ("core-1", "B"),
-            ("core-2", "A"),
-            ("core-2", "A"),
-            ("core-2", "B"),
-            ("core-2", "B"),
-            ("negative-control", "A"),
-            ("negative-control", "B"),
+        assignment_pairs = tuple(
+            assignment_id.rsplit("-", 2)[:2] for assignment_id in ASSIGNMENT_IDS
         )
         outcomes = self.packets["instruct_eval.evidence_audit"][-1]["outcomes"]
         released = [
@@ -505,15 +507,43 @@ class _ControlledBackend(worker.InstructEvalActivityBackend):
             await asyncio.sleep(0)
             token = request.payload["token"]
             index = self.tokens.index(token)
+            outcome: dict[str, Any]
+            if self.invalid_subject:
+                outcome = {"protocol_valid": False}
+            else:
+                scenario, condition, _ = ASSIGNMENT_IDS[index].rsplit("-", 2)
+                outcome = {
+                    "blind_id": sha256(token.encode()).hexdigest(),
+                    "fixture": scenario,
+                    "protocol_valid": True,
+                    "verifier_passed": condition == "B",
+                    "observer_state": "passed",
+                    "direction_code": "better" if condition == "B" else "same",
+                    "changed_paths": [],
+                    "evidence_id": "evidence",
+                }
             return {
-                "blind_id": sha256(token.encode()).hexdigest(),
-                "fixture": "fixture",
-                "protocol_valid": True,
-                "verifier_passed": index in {2, 3, 6, 7},
-                "observer_state": "passed",
-                "direction_code": "better" if index in {2, 3, 6, 7} else "same",
-                "changed_paths": [],
-                "evidence_id": "evidence",
+                "outcome": outcome,
+                "private_artifacts": {
+                    "response": "retained-capture",
+                    "runtime_streams": {
+                        "stdout": "retained-stdout",
+                        "stderr": "retained-stderr",
+                        "output_events": "retained-events",
+                    },
+                    "tool_outputs": ["retained-tool-output"],
+                    "diff": "retained-diff",
+                    "verifier": {
+                        "passed": not self.invalid_subject and outcome["verifier_passed"],
+                        "stdout": "retained-verifier-stdout",
+                        "stderr": "retained-verifier-stderr",
+                    },
+                    "observer": {"result": "retained-observer"},
+                    "trusted_logs": {
+                        "reason": "retained protocol failure" if self.invalid_subject else None,
+                        "unchanged_hashes": {},
+                    },
+                },
             }
         finally:
             self.active_subjects -= 1
@@ -529,33 +559,38 @@ class _ControlledBackend(worker.InstructEvalActivityBackend):
         token = request.payload["token"]
         if token not in self.tokens:
             raise AssertionError("controlled subject finalization received an invalid token")
-        closed_outcome = self._closed_subject_outcome(outcome)
+        closed_outcome = self._closed_subject_outcome(outcome["outcome"])
+        outcome_relative = (
+            f"quarantine/{request.campaign_id}/{request.experiment_id}/{token}/outcome.json"
+        )
         outcome_sha256 = self.artifacts.publish_json(
-            f"quarantine/{request.campaign_id}/{request.experiment_id}/{token}.json",
+            outcome_relative,
             closed_outcome,
             ArtifactMode.PRIVATE,
         )
+        for artifact_kind, artifact in outcome["private_artifacts"].items():
+            self.artifacts.publish_json(
+                f"quarantine/{request.campaign_id}/{request.experiment_id}/"
+                f"{token}/{artifact_kind}.json",
+                artifact,
+                ArtifactMode.PRIVATE,
+            )
         existing = self.finalized_subjects.setdefault(token, outcome_sha256)
         if existing != outcome_sha256:
             raise AssertionError("controlled subject finalization is not immutable")
 
 
-def _provisioning_error(error: BaseException) -> bool:
-    text = f"{type(error).__module__}.{type(error).__name__}: {error}".lower()
-    return any(
-        marker in text
-        for marker in ("test server", "test_server", "download", "provision", "ephemeral")
-    )
-
-
 class TemporalIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
-        try:
-            self.env = await WorkflowEnvironment.start_time_skipping()
-        except Exception as error:
-            if _provisioning_error(error):
-                self.skipTest(f"Temporal SDK test server cannot be provisioned: {error}")
-            raise
+        address = os.environ.get("TEMPORAL_ADDRESS")
+        temporal_cli = os.environ.get("TEMPORAL_CLI")
+        temporal_database = os.environ.get("TEMPORAL_DATABASE")
+        if not address or not temporal_cli or not temporal_database:
+            self.skipTest("TEMPORAL_ADDRESS, TEMPORAL_CLI, and TEMPORAL_DATABASE are required")
+        assert Path(temporal_cli).is_file()
+        assert Path(temporal_database).is_file()
+        client = await Client.connect(address, namespace="default")
+        self.env = WorkflowEnvironment.from_client(client)
         self.directory, self.private_key = (
             tempfile.TemporaryDirectory(),
             Ed25519PrivateKey.generate(),
@@ -848,16 +883,7 @@ class TemporalIntegrationTests(unittest.IsolatedAsyncioTestCase):
         execution_packet = backend.packets["instruct_eval.execution_commit"][0]
         assert execution_packet["protocol_valid"] is True
         assert execution_packet["verifier_passed"] == [
-            False,
-            False,
-            True,
-            True,
-            False,
-            False,
-            True,
-            True,
-            False,
-            False,
+            assignment_id.rsplit("-", 2)[1] == "B" for assignment_id in ASSIGNMENT_IDS
         ]
 
     @staticmethod
@@ -876,11 +902,11 @@ class TemporalIntegrationTests(unittest.IsolatedAsyncioTestCase):
         assert context.result.campaign_id == CAMPAIGN_ID
         await self._await_count(
             lambda: backend.calls["instruct_eval.subject_trial"],
-            10,
+            len(ASSIGNMENT_IDS),
             "subject trials",
             backend,
         )
-        assert backend.calls["instruct_eval.subject_trial"] == 10
+        assert backend.calls["instruct_eval.subject_trial"] == len(ASSIGNMENT_IDS)
         assert backend.max_active_subjects <= 4
         self._assert_authorization_packets(backend, context.claim_sha256)
         self._assert_freeze_and_execution_packets(backend)
@@ -957,18 +983,62 @@ class TemporalIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_campaign_happy_path_has_real_history_routing_and_replay(self) -> None:
         backend = _ControlledBackend(Path(self.directory.name))
+        entered, release = threading.Event(), threading.Event()
+        eligibility = backend._operations.eligibility
+
+        def blocked_eligibility(*args: Any) -> Any:
+            entered.set()
+            if not release.wait(timeout=10):
+                raise AssertionError("blocked role was not released")
+            return eligibility(*args)
+
+        backend._operations = replace(backend._operations, eligibility=blocked_eligibility)
+        public, private = await self._workers(backend)
+        try:
+            async with public, private:
+                async with asyncio.TaskGroup() as group:
+                    run = group.create_task(self._run_happy_path(backend))
+                    try:
+                        assert await asyncio.to_thread(entered.wait, 10)
+                        campaign = self.env.client.get_workflow_handle(CAMPAIGN_ID)
+                        status = await campaign.query("status", rpc_timeout=timedelta(seconds=2))
+                        assert status["state"] == "RUNNING"
+                        assert not run.done()
+                    finally:
+                        release.set()
+                context = run.result()
+            await self._assert_happy_path_oracles(context, backend)
+        finally:
+            backend.close()
+
+    async def test_invalid_subject_evidence_commits_privately_then_terminalizes_g3(self) -> None:
+        backend = _ControlledBackend(Path(self.directory.name), invalid_subject=True)
         public, private = await self._workers(backend)
         try:
             async with public, private:
                 context = await self._run_happy_path(backend)
-            await self._assert_happy_path_oracles(context, backend)
+            assert context.result.claims[0].terminal_gate == "PROTOCOL_FAILURE"
+            assert backend.calls["instruct_eval.execution_commit"] == 1
+            assert backend.calls["instruct_eval.release"] == 0
+            assert backend.finalized_subjects
+            token = next(iter(backend.finalized_subjects))
+            private_root = f"quarantine/{CAMPAIGN_ID}/{backend.issued[0]['experiment_id']}/{token}"
+            assert json.loads(
+                backend.artifacts.read_bytes(f"{private_root}/outcome.json", ArtifactMode.PRIVATE)
+            ) == {"protocol_valid": False}
+            for artifact_kind in SUBJECT_ARTIFACT_KINDS - {"outcome"}:
+                assert backend.artifacts.read_bytes(
+                    f"{private_root}/{artifact_kind}.json", ArtifactMode.PRIVATE
+                )
+            history = self._history_text(await context.child.fetch_history())
+            assert "retained-capture" not in history
         finally:
             backend.close()
 
     async def test_terminal_gates_are_durable_after_real_authorization(self) -> None:
         scenarios = (
-            _TerminalScenario("terminal-0", reject_g0=True, reject_g2=False),
-            _TerminalScenario("terminal-1", reject_g0=False, reject_g2=True),
+            _TerminalScenario(f"{CAMPAIGN_ID}-terminal-0", reject_g0=True, reject_g2=False),
+            _TerminalScenario(f"{CAMPAIGN_ID}-terminal-1", reject_g0=False, reject_g2=True),
         )
         for scenario in scenarios:
             await self._run_terminal_scenario(scenario)
@@ -980,12 +1050,12 @@ class TemporalIntegrationTests(unittest.IsolatedAsyncioTestCase):
             async with public, private:
                 probe = await self.env.client.start_workflow(
                     TimeoutProbeWorkflow.run,
-                    id="timeout-probe",
+                    id=f"{CAMPAIGN_ID}-timeout-probe",
                     task_queue=PUBLIC_QUEUE,
                 )
                 await self._assert_timeout_failure(probe)
                 handle = await self._start_campaign(
-                    self._campaign_start_request("cancel-integration")
+                    self._campaign_start_request(f"{CAMPAIGN_ID}-cancel-integration")
                 )
                 await self.env.sleep(0)
                 await handle.cancel()

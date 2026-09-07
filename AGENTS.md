@@ -63,12 +63,17 @@ Produce the condition-independent experiment design and reachable witness set fo
 
 ### Step 3: Establish runtime boundaries
 
-Provision the production runtime and verify the public/private capability split before creating
-campaign state.
+Establish local Temporal first, then provision the production runtime and verify the public/private
+capability split before creating campaign state. An absent CLI or stopped service is normal preflight
+setup, not a missing control or treatment runtime.
 
-- Read: [artifact routing](references/artifact-routing.md) and
+- Read: [local Temporal preflight](references/gate-transitions.md#local-temporal-preflight),
+  [artifact routing](references/artifact-routing.md), and
   [artifact layout](references/artifact-layout.md).
-- Exit: both workers and durable stores satisfy the referenced routing and storage contracts.
+- Execute: [Prepare local Temporal](README.md#2-prepare-local-temporal) covers first installation,
+  readiness checks, and restarting a stopped service with its existing database.
+- Exit: local Temporal passes the referenced readiness checks, and both workers and durable stores
+  satisfy the referenced routing and storage contracts.
 
 ### Step 4: Authorize decomposition
 
@@ -123,6 +128,12 @@ replay path.
 
 Translate the terminal protocol result and released public evidence into a decision-ready report
 without rescoring outcomes or changing the G6 result.
+
+Step 9 is mandatory before declaring the evaluation complete. Immediately before delivering results,
+read `references/result-reporting.md` and verify that the response satisfies its required template and
+interpretation requirements. This requirement applies after context replacement or handoff and takes
+precedence over generic completion formats. Published artifacts or a summary of results do not
+substitute for the Step 9 report.
 
 - Read: [evaluation result reporting](references/result-reporting.md),
   [artifact layout](references/artifact-layout.md), and

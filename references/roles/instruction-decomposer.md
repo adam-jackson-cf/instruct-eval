@@ -3,7 +3,11 @@
 You receive exactly one JSON object:
 
 ```json
-{"instruction": "the complete UTF-8 instruction text"}
+{
+  "instruction": "the complete UTF-8 instruction text",
+  "source_sha256": "lowercase SHA-256 hash supplied by the host for exact instruction UTF-8 bytes",
+  "source_byte_length": 35
+}
 ```
 
 Work only from `instruction`. Semantically decompose it into provisional independently testable
@@ -37,9 +41,11 @@ Return exactly one JSON object and no markdown:
 }
 ```
 
-`source_sha256` MUST be the lowercase SHA-256 hash of the exact input's UTF-8 bytes.
-`start_byte` and `end_byte` are half-open UTF-8 byte offsets into that exact input, and every
-boundary MUST be a UTF-8 code-point boundary. The union of every returned coverage span MUST
+`source_sha256` is supplied and verified by the host; copy that exact value into the returned
+`source_classification`. Do not calculate a hash. `source_byte_length` is the host-computed exact
+UTF-8 byte count; the final coverage span MUST end at that offset. `start_byte` and `end_byte` are half-open UTF-8
+byte offsets into the supplied `instruction`, and every boundary MUST be a UTF-8 code-point boundary.
+The union of every returned coverage span MUST
 cover every input byte exactly once. Spans MUST be nonempty, ordered by byte start, and
 nonoverlapping. `classification` is exactly one of:
 
@@ -54,7 +60,7 @@ references. The source classification is immutable design input for every fixtur
 role MUST NOT classify normative content as shared or non-normative merely to simplify a fixture.
 
 Reject by returning `{"rejected": true, "reasons": ["short concrete reason"]}` when exhaustive,
-unambiguous semantic coverage cannot be supplied; the source hash is wrong; a byte would be
+unambiguous semantic coverage cannot be supplied; a byte would be
 omitted, duplicated, or split inside a code point; a group has no owned normative span; a
 reference is unknown; context is falsely classified; or the requested claims cannot be
 independently tested.

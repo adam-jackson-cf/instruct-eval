@@ -29,6 +29,7 @@ from .coordination import (
     GateRequest as CoordinationGateRequest,
 )
 from .models import ProtocolError, canonical_bytes
+from .trials import ASSIGNMENT_IDS, authorization_rule
 
 _MAX_PACKET_BYTES = 1 << 20
 _FORBIDDEN_KEYS = frozenset(
@@ -253,20 +254,13 @@ def _release_preferred_directions(payload: Mapping[str, Any]) -> None:
 
 
 def _release_authorization_rule(payload: Mapping[str, Any]) -> None:
-    expected_rule = {
-        "schema": "instruct-eval-authorization-rule-v1",
-        "core_scenarios": ["core-1", "core-2"],
-        "negative_control_scenario": "negative-control",
-        "core_comparison": "preferred_count_B_strictly_greater_than_A",
-        "negative_control_comparison": "both_subjects_match_preferred_direction",
-    }
-    if payload["authorization_rule"] != expected_rule:
+    if payload["authorization_rule"] != authorization_rule():
         raise ActivitySemanticError("G5 release authorization rule is invalid")
 
 
 def _release_assignment_records(assignments: Any) -> list[tuple[str, str, str, str]]:
-    if not isinstance(assignments, list) or len(assignments) != 10:
-        raise ActivitySemanticError("G5 release must contain exactly ten assignments")
+    if not isinstance(assignments, list) or len(assignments) != len(ASSIGNMENT_IDS):
+        raise ActivitySemanticError("G5 release must contain every canonical assignment")
     records: list[tuple[str, str, str, str]] = []
     for record in assignments:
         if not isinstance(record, Mapping) or set(record) != {
@@ -284,29 +278,20 @@ def _release_assignment_records(assignments: Any) -> list[tuple[str, str, str, s
 
 
 def _validate_release_assignment_design(records: list[tuple[str, str, str, str]]) -> None:
-    expected = {
-        ("core-1", "A"),
-        ("core-1", "B"),
-        ("core-2", "A"),
-        ("core-2", "B"),
-        ("negative-control", "A"),
-        ("negative-control", "B"),
-    }
+    expected_counts: dict[tuple[str, str], int] = {}
+    for assignment in ASSIGNMENT_IDS:
+        pair = (assignment.rsplit("-", 2)[0], assignment.rsplit("-", 2)[1])
+        expected_counts[pair] = expected_counts.get(pair, 0) + 1
+    actual_counts: dict[tuple[str, str], int] = {}
+    for _, scenario, condition, _ in records:
+        pair = (scenario, condition)
+        actual_counts[pair] = actual_counts.get(pair, 0) + 1
     if (
         records != sorted(records)
-        or len({record[0] for record in records}) != 10
-        or {(record[1], record[2]) for record in records} != expected
+        or len({record[0] for record in records}) != len(ASSIGNMENT_IDS)
+        or actual_counts != expected_counts
     ):
-        raise ActivitySemanticError("G5 release assignments do not cover the exact design")
-    counts = {
-        (scenario, condition): sum(record[1:3] == (scenario, condition) for record in records)
-        for scenario, condition in expected
-    }
-    if any(
-        counts[(scenario, condition)] != (1 if scenario == "negative-control" else 2)
-        for scenario, condition in expected
-    ):
-        raise ActivitySemanticError("G5 release assignment multiplicity is invalid")
+        raise ActivitySemanticError("G5 release assignments do not cover the canonical allocation")
 
 
 def _release_packet(payload: Mapping[str, Any]) -> bytes:
@@ -922,10 +907,12 @@ class InstructEvalActivities:
             ):
                 raise ActivitySemanticError("gate backend returned an invalid publication type")
             return publication
-        except ProtocolError:
-            return self._protocol_failure_publication(request, endpoint)
+        except ProtocolError as error:
+            return self._protocol_failure_publication(request, endpoint, error)
 
-    def _protocol_failure_publication(self, request: GateRequest, endpoint: str) -> GatePublication:
+    def _protocol_failure_publication(
+        self, request: GateRequest, endpoint: str, error: ProtocolError
+    ) -> GatePublication:
         payload = {"accepted": False, "protocol_failure": True}
         artifact_bytes = canonical_bytes(payload)
         artifacts = getattr(self._backend, "_artifacts", None)
@@ -936,6 +923,12 @@ class InstructEvalActivities:
             f"{request.workflow_id}/{request.run_id}/protocol-failures/"
             f"{request.ordinal:03d}-{endpoint}.json"
         )
+        if hasattr(artifacts, "private_root"):
+            artifacts.publish_json(
+                Path(relative_path).with_suffix("") / "trusted_logs.json",
+                {"reason": str(error)},
+                ArtifactMode.PRIVATE,
+            )
         return GatePublication(
             payload,
             artifacts.path_for(relative_path, ArtifactMode.PUBLIC),

@@ -7,32 +7,44 @@ import difflib
 import json
 import os
 import re
+import selectors
 import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Generator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any
+from typing import IO, Any
 from urllib.error import URLError
 from urllib.request import urlopen
 
+from .behavior import (
+    OBSERVATION_CONTRACT,
+    BehaviorError,
+    decode_completion_response,
+    project_subject_evidence,
+)
 from .models import (
     Fixture,
     ProtocolError,
     ReachabilityWitness,
     WitnessExecutionResult,
+    canonical_bytes,
     canonical_hash,
 )
 
-_FILESYSTEM_TOOLS = frozenset({"read", "edit", "write", "glob", "grep"})
+_PERMITTED_TOOLS = frozenset({"read", "edit", "write", "glob", "grep", "bash"})
+_MUTATING_TOOLS = ("write", "edit", "bash")
 _SYSTEM_READS = (
     "/System",
     "/usr/lib",
@@ -44,8 +56,11 @@ _SYSTEM_READS = (
 )
 _MAX_EVIDENCE_BYTES = 2 << 20
 _MAX_STREAM_BYTES = 1 << 20
+# RPC includes repeated partial-message snapshots, unlike terminal result streams.
+_MAX_TRANSPORT_BYTES = 64 << 20
 _MAX_RESULT_TEXT_BYTES = 1 << 18
 _EXPERIMENTS_ROOT = Path(__file__).parents[2] / "experiments"
+_VERIFIED_RUNTIME_INPUT = "[verified runtime input]"
 
 
 def _experiment_prefix(kind: str, identity: str = "") -> str:
@@ -77,17 +92,44 @@ class SandboxError(RoleRuntimeError):
     """A child process could not be constrained to its permitted mounts."""
 
 
+def prepare_decomposition_packet(
+    instruction: str,
+) -> Mapping[str, Any]:
+    """Bind an instruction's exact UTF-8 bytes before tool-free decomposition."""
+    if not isinstance(instruction, str) or not instruction:
+        raise RoleRuntimeError("decomposition instruction must be a nonempty string")
+    source_bytes = instruction.encode("utf-8")
+    return MappingProxyType(
+        {
+            "instruction": instruction,
+            "source_sha256": sha256(source_bytes).hexdigest(),
+            "source_byte_length": len(source_bytes),
+        }
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionResult:
-    """Bounded, child-safe output retained by a runtime caller."""
+    """Complete private transport and input-verified output evidence."""
 
     text: str
     payload: Mapping[str, Any] | None
     tool_outputs: tuple[str, ...]
+    output_events: str
+    input_verified: bool
     stdout: str = ""
     stderr: str = ""
+    protocol_failure: str | None = None
+    disclosure_tool_outputs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if not isinstance(self.input_verified, bool):
+            raise RoleRuntimeError("OMP input verification is malformed")
+        if self.protocol_failure is not None and (
+            not isinstance(self.protocol_failure, str)
+            or len(self.protocol_failure.encode("utf-8")) > _MAX_RESULT_TEXT_BYTES
+        ):
+            raise RoleRuntimeError("OMP protocol failure exceeds the runtime bound")
         if (
             not isinstance(self.text, str)
             or len(self.text.encode("utf-8")) > _MAX_RESULT_TEXT_BYTES
@@ -95,16 +137,17 @@ class ExecutionResult:
             raise RoleRuntimeError("OMP result text exceeds the runtime bound")
         if self.payload is not None and not isinstance(self.payload, Mapping):
             raise RoleRuntimeError("OMP role payload must be an object")
+        if len(self.tool_outputs) != len(self.disclosure_tool_outputs):
+            raise RoleRuntimeError("OMP disclosure tool output projection is incomplete")
         if any(
             not isinstance(item, str) or len(item.encode("utf-8")) > _MAX_RESULT_TEXT_BYTES
-            for item in self.tool_outputs
+            for outputs in (self.tool_outputs, self.disclosure_tool_outputs)
+            for item in outputs
         ):
             raise RoleRuntimeError("OMP tool output exceeds the runtime bound")
-        if (
-            not isinstance(self.stdout, str)
-            or len(self.stdout.encode("utf-8")) > _MAX_STREAM_BYTES
-            or not isinstance(self.stderr, str)
-            or len(self.stderr.encode("utf-8")) > _MAX_STREAM_BYTES
+        if any(
+            not isinstance(stream, str) or len(stream.encode("utf-8")) > _MAX_TRANSPORT_BYTES
+            for stream in (self.stdout, self.stderr, self.output_events)
         ):
             raise RoleRuntimeError("OMP process stream exceeds the runtime bound")
         object.__setattr__(
@@ -157,6 +200,8 @@ class SubjectResult:
     runtime_stderr: str = ""
     verifier_stdout: str = ""
     verifier_stderr: str = ""
+    runtime_output_events: str = ""
+    disclosure_tool_outputs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -185,10 +230,11 @@ class SubjectResult:
             for value in self.observer_output.values()
         ):
             raise RoleRuntimeError("subject observer output exceeds the evidence bound")
+        if len(self.tool_outputs) != len(self.disclosure_tool_outputs):
+            raise RoleRuntimeError("subject disclosure tool output projection is incomplete")
         streams = (
             *self.tool_outputs,
-            self.runtime_stdout,
-            self.runtime_stderr,
+            *self.disclosure_tool_outputs,
             self.verifier_stdout,
             self.verifier_stderr,
         )
@@ -197,6 +243,15 @@ class SubjectResult:
             for value in streams
         ):
             raise RoleRuntimeError("subject raw stream exceeds the evidence bound")
+        if any(
+            not isinstance(value, str) or len(value.encode("utf-8")) > _MAX_TRANSPORT_BYTES
+            for value in (
+                self.runtime_stdout,
+                self.runtime_stderr,
+                self.runtime_output_events,
+            )
+        ):
+            raise RoleRuntimeError("subject transport exceeds the evidence bound")
         object.__setattr__(
             self,
             "unchanged_hashes",
@@ -223,6 +278,7 @@ class SubjectResult:
             "runtime_stderr": self.runtime_stderr,
             "verifier_stdout": self.verifier_stdout,
             "verifier_stderr": self.verifier_stderr,
+            "runtime_output_events": self.runtime_output_events,
         }
 
 
@@ -236,6 +292,7 @@ class OmpExecutionRequest:
     system_prompt: str
     tools: Sequence[str]
     expect_json: bool
+    observe_tools: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,6 +355,8 @@ class _SubjectCapture:
             self.execution.stderr,
             outcome.verifier_stdout,
             outcome.verifier_stderr,
+            runtime_output_events=self.execution.output_events,
+            disclosure_tool_outputs=self.execution.disclosure_tool_outputs,
         )
 
 
@@ -366,7 +425,7 @@ def _port() -> int:
         return int(listener.getsockname()[1])
 
 
-def _stop(process: subprocess.Popen[str] | None) -> None:
+def _stop(process: subprocess.Popen[Any] | None) -> None:
     if process is None:
         return
     if process.poll() is None:
@@ -536,21 +595,45 @@ def _start_gateway(executable: Path, home: Path) -> _Gateway:
         raise
 
 
+@dataclass(frozen=True, slots=True)
+class _SandboxNetwork:
+    outbound_ports: tuple[int, ...] = ()
+    gate_port: int | None = None
+
+
 def _sandbox(
     argv: Sequence[str],
     workspace: Path,
     home: Path,
     read_only: Sequence[Path],
+    network: _SandboxNetwork,
 ) -> list[str]:
     def escaped(path: Path) -> str:
         return str(path.resolve(strict=True)).replace("\\", "\\\\").replace('"', '\\"')
 
-    if not workspace.is_dir() or not home.is_dir():
-        raise SandboxError("sandbox mount is unavailable")
+    gate_port = network.gate_port
+
+    if (
+        not workspace.is_dir()
+        or not home.is_dir()
+        or any(
+            not isinstance(port, int) or not 1 <= port <= 65535 for port in network.outbound_ports
+        )
+        or (
+            gate_port is not None
+            and (not isinstance(gate_port, int) or not 1 <= gate_port <= 65535)
+        )
+    ):
+        raise SandboxError("sandbox mount or endpoint is unavailable")
     paths = " ".join(
         f'(subpath "{escaped(path.parent)}") (literal "{escaped(path)}")' for path in read_only
     )
     systems = " ".join(f'(subpath "{path}")' for path in _SYSTEM_READS)
+    outbound = " ".join(f'(remote ip "localhost:{port}")' for port in network.outbound_ports)
+    inbound = ""
+    if gate_port is not None:
+        outbound += f' (remote ip "localhost:{gate_port}")'
+        inbound = f' (allow network-inbound (local ip "localhost:{gate_port}"))'
     profile = (
         "(version 1) (deny default) "
         + (
@@ -560,10 +643,10 @@ def _sandbox(
             f'(subpath "{escaped(home)}") {paths}) '
         )
         + '(allow file-read-metadata (subpath "/usr") (subpath "/var")) '
-        + f'(allow file-write* (subpath "{escaped(workspace)}") '
+        + f'(allow file-write* (literal "/dev/null") (subpath "{escaped(workspace)}") '
         f'(subpath "{escaped(home)}")) '
         + "(allow process*) (allow sysctl-read) (allow mach-lookup) "
-        '(allow network-outbound (remote ip "localhost:*"))'
+        + f"(allow network-outbound {outbound}){inbound}"
     )
     return ["/usr/bin/sandbox-exec", "-p", profile, *argv]
 
@@ -613,25 +696,202 @@ def _tool_execution_text(event: Mapping[str, Any]) -> str | None:
     return _content_text(content) if isinstance(content, list) else None
 
 
-def _terminal_text(stdout: str, *, required: bool) -> tuple[str, tuple[str, ...]]:
-    if len(stdout.encode("utf-8")) > _MAX_STREAM_BYTES:
+def _project_input_echo(event: dict[str, Any], prompt: str) -> tuple[int, bool]:
+    """Remove only exact supplied input content from known transport locations."""
+    kind = event.get("type")
+    if kind in ("message_start", "message_end"):
+        messages = [event.get("message")]
+    elif kind == "agent_end" and isinstance(event.get("messages"), list):
+        messages = event["messages"]
+    else:
+        return 0, True
+    count, verified = 0, True
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        count += 1
+        if message.get("content") == [{"type": "text", "text": prompt}]:
+            message["content"] = []
+        else:
+            verified = False
+    return count, verified
+
+
+@dataclass
+class _InputReadProjection:
+    """Project only native copies proven to contain the complete supplied input."""
+
+    input_file: tuple[str, str] | None
+    expected: tuple[object, ...] = field(init=False, default=())
+    started: dict[str, str] = field(default_factory=dict)
+    ended: set[str] = field(default_factory=set)
+    proven: set[str] = field(default_factory=set)
+    valid: bool = True
+
+    def __post_init__(self) -> None:
+        if self.input_file is not None:
+            path, text = self.input_file
+            lines = text.count("\n") + 1
+            self.expected = (
+                [{"type": "text", "text": text}],
+                len(text.encode("utf-8")),
+                lines,
+                {"text": text, "startLine": 1, "lineNumbers": list(range(1, lines + 1))},
+                {"type": "path", "value": path},
+            )
+
+    def _matches(self, result: dict[str, Any]) -> bool:
+        details = result.get("details")
+        if not isinstance(details, dict) or not isinstance(details.get("meta"), dict):
+            return False
+        matches = (
+            result.get("content"),
+            details.get("fileSize"),
+            details.get("totalLines"),
+            details.get("displayContent"),
+            details["meta"].get("source"),
+        ) == self.expected
+        return matches and all(
+            type(value) is int
+            for value in (
+                details["fileSize"],
+                details["totalLines"],
+                details["displayContent"]["startLine"],
+                *details["displayContent"]["lineNumbers"],
+            )
+        )
+
+    def _call(self, event: Mapping[str, Any]) -> str | None:
+        call_id = event.get("toolCallId")
+        if (
+            isinstance(call_id, str)
+            and self.started.get(call_id) == "read"
+            and event.get("toolName") == "read"
+            and event.get("isError") is False
+        ):
+            return call_id
+        return None
+
+    @staticmethod
+    def _replace(result: dict[str, Any]) -> None:
+        result["content"][0]["text"] = _VERIFIED_RUNTIME_INPUT
+        result["details"]["displayContent"]["text"] = _VERIFIED_RUNTIME_INPUT
+
+    def _start(self, event: Mapping[str, Any]) -> None:
+        call_id, name = event.get("toolCallId"), event.get("toolName")
+        if isinstance(call_id, str) and call_id and isinstance(name, str):
+            if call_id in self.started:
+                self.valid = False
+            self.started[call_id] = name
+
+    def _end(self, event: dict[str, Any]) -> bool:
+        call_id = event.get("toolCallId")
+        if not isinstance(call_id, str) or self.started.get(call_id) != "read":
+            return False
+        if call_id in self.ended:
+            self.valid = False
+            return False
+        self.ended.add(call_id)
+        result = event.get("result")
+        if not isinstance(result, dict) or self._call(event) is None or not self._matches(result):
+            return False
+        self.proven.add(call_id)
+        self._replace(result)
+        return True
+
+    def _copy(self, message: Any) -> bool:
+        if not isinstance(message, dict) or message.get("role") != "toolResult":
+            return False
+        call_id = self._call(message)
+        if call_id not in self.proven or not self._matches(message):
+            return False
+        self._replace(message)
+        return True
+
+    def project(self, event: dict[str, Any]) -> bool:
+        if self.input_file is None or not self.valid:
+            return False
+        kind = event.get("type")
+        if kind == "tool_execution_start":
+            self._start(event)
+        elif kind == "tool_execution_end":
+            return self._end(event)
+        elif kind in ("message_start", "message_end"):
+            return self._copy(event.get("message"))
+        elif kind in ("turn_end", "agent_end"):
+            messages = event.get("toolResults" if kind == "turn_end" else "messages")
+            if isinstance(messages, list):
+                changed = False
+                for message in messages:
+                    changed |= self._copy(message)
+                return changed
+        return False
+
+
+@dataclass(frozen=True, slots=True)
+class _TerminalContext:
+    response: Mapping[str, Any] | None = None
+    protocol_failure: str | None = None
+    input_file: tuple[str, str] | None = None
+
+
+def _terminal_output(
+    stdout: str,
+    stderr: str,
+    *,
+    prompt: str,
+    required: bool,
+    context: _TerminalContext | None = None,
+) -> ExecutionResult:
+    context_response = context.response if context is not None else None
+    protocol_failure = context.protocol_failure if context is not None else None
+    input_reads = _InputReadProjection(context.input_file if context is not None else None)
+    if len(stdout.encode("utf-8")) > _MAX_TRANSPORT_BYTES:
         raise RoleRuntimeError("OMP JSON stream exceeds the runtime bound")
-    messages: list[str] = []
+    text = ""
     tool_output: list[str] = []
-    ended = False
-    for line in stdout.splitlines():
+    disclosure_tool_output: list[str] = []
+    output_events: list[str] = []
+    echoes = {"message_start": 0, "message_end": 0, "agent_end": 0}
+    verified, ended = True, False
+    for line in stdout.splitlines(keepends=True):
         event = _terminal_event(line)
         message = _assistant_message_text(event)
         tool_result = _tool_execution_text(event)
+        read_projected = input_reads.project(event)
         if message:
-            messages.append(message)
+            text = message
         if tool_result is not None:
             tool_output.append(tool_result)
+            disclosure_tool_output.append(
+                _VERIFIED_RUNTIME_INPUT if read_projected else tool_result
+            )
+        count, matches = _project_input_echo(event, prompt)
+        context_echo = context_response is not None and event == context_response
+        if context_echo:
+            event = {**event, "data": {"systemPrompt": _VERIFIED_RUNTIME_INPUT}}
+        if count:
+            echoes[event["type"]] += count
+        verified = verified and matches
+        output_events.append(
+            json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+            if count or context_echo or read_projected
+            else line
+        )
         ended = ended or event.get("type") == "agent_end"
-    text = "\n".join(messages)
-    if not ended or (required and not text):
+    if protocol_failure is None and (not ended or (required and not text)):
         raise RoleRuntimeError("OMP JSON stream is incomplete")
-    return text, tuple(tool_output)
+    return ExecutionResult(
+        text,
+        _role_json(text) if required and protocol_failure is None else None,
+        tuple(tool_output),
+        "".join(output_events),
+        verified and input_reads.valid and all(count == 1 for count in echoes.values()),
+        stdout,
+        stderr,
+        protocol_failure,
+        tuple(disclosure_tool_output),
+    )
 
 
 def _execution_settings(
@@ -672,8 +932,8 @@ def _execution_settings(
         raise RoleRuntimeError("permission configuration is invalid")
     if not isinstance(timeout, int) or timeout <= 0:
         raise RoleRuntimeError("runtime timeout is invalid")
-    if not set(tools).issubset(_FILESYSTEM_TOOLS) or not set(tools).issubset(set(allowed_tools)):
-        raise RoleRuntimeError("requested tools exceed frozen filesystem permissions")
+    if not set(tools).issubset(_PERMITTED_TOOLS) or not set(tools).issubset(set(allowed_tools)):
+        raise RoleRuntimeError("requested tools exceed frozen permissions")
     return _OmpSettings(f"{provider}/{identifier}", thinking, approval, timeout)
 
 
@@ -716,16 +976,52 @@ def _runtime_native(request: Mapping[str, Any]) -> tuple[str, Path]:
     return runtime_version, native
 
 
-def _prepare_runtime_home(root: Path, profile: str) -> Path:
+def _prepare_runtime_home(root: Path, profile: str, observe_tools: bool = False) -> Path:
     home = root / "home"
     directories = (
         home,
         home / ".config",
         home / ".local" / "share",
+        home / "tmp",
         home / ".omp" / "profiles" / profile / "agent",
     )
     for directory in directories:
         directory.mkdir(parents=True, exist_ok=True)
+    (directories[-1] / "config.yml").write_text(
+        json.dumps(
+            {
+                "disabledProviders": [
+                    "claude",
+                    "codex",
+                    "gemini",
+                    "opencode",
+                    "github",
+                    "agents",
+                    "agents-md",
+                    "claude-md",
+                    "omp-plugins",
+                    "agent-plugins",
+                    "claude-plugins",
+                    "cursor",
+                    "windsurf",
+                    "cline",
+                    "vscode",
+                    "mcp-json",
+                    "ssh-json",
+                    "builtin-defaults",
+                ],
+                "disabledExtensions": ["context-file:user:AGENTS.md"],
+                "async": {"enabled": False},
+                "bash": {"autoBackground": {"enabled": False}},
+                **(
+                    {"tools": {"approval": dict.fromkeys(_MUTATING_TOOLS, "prompt")}}
+                    if observe_tools
+                    else {}
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
     return home
 
 
@@ -750,11 +1046,12 @@ def _omp_argv(
     profile: str,
     settings: _OmpSettings,
     execution: OmpExecutionRequest,
+    observer: Path | None,
 ) -> list[str]:
     argv = [
         str(executable),
         "--mode",
-        "json",
+        "rpc",
         "--model",
         settings.model,
         "--thinking",
@@ -772,16 +1069,18 @@ def _omp_argv(
             "--no-skills",
             "--no-extensions",
             "--no-prewalk",
+            "--no-lsp",
+            "--no-pty",
             "--system-prompt",
             execution.system_prompt,
-            "-p",
-            execution.prompt,
         ]
     )
+    if observer is not None:
+        argv.extend(["--hook", str(observer)])
     return argv
 
 
-def _runtime_environment(home: Path, root: Path) -> dict[str, str]:
+def _runtime_environment(home: Path, gate_port: int | None = None) -> dict[str, str]:
     environment = {
         name: os.environ[name] for name in ("LANG", "LC_ALL", "TERM") if name in os.environ
     }
@@ -792,10 +1091,325 @@ def _runtime_environment(home: Path, root: Path) -> dict[str, str]:
             "XDG_CONFIG_HOME": str(home / ".config"),
             "XDG_DATA_HOME": str(home / ".local" / "share"),
             "XDG_CACHE_HOME": str(home / ".cache"),
-            "TMPDIR": str(root / "tmp"),
+            "TMPDIR": str(home / "tmp"),
+            "PATH": f"{Path(sys.executable).resolve().parent}:/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "INSTRUCT_EVAL_EVIDENCE_BYTES": str(_MAX_EVIDENCE_BYTES),
         }
     )
+    if gate_port is not None:
+        if not 1 <= gate_port <= 65535:
+            raise RoleRuntimeError("gate snapshot endpoint is unavailable")
+        environment["INSTRUCT_EVAL_GATE_PORT"] = str(gate_port)
     return environment
+
+
+def _python_runtime_reads() -> tuple[Path, ...]:
+    library = (
+        Path(sys.base_prefix) / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+    )
+    return Path(sys.executable).resolve(), library
+
+
+def _supplied_input_file(execution: OmpExecutionRequest) -> tuple[str, str] | None:
+    treatment = execution.request.get("candidate_instruction")
+    if treatment is None:
+        return None
+    if not isinstance(treatment, str):
+        raise RoleRuntimeError("OMP supplied treatment is malformed")
+    return str(execution.workspace / ".omp" / "AGENTS.md"), treatment
+
+
+def _validate_runtime_context(response: Mapping[str, Any], execution: OmpExecutionRequest) -> None:
+    data = response.get("data")
+    prompts = data.get("systemPrompt") if isinstance(data, Mapping) else None
+    if (
+        response.get("success") is not True
+        or not isinstance(data, Mapping)
+        or not isinstance(prompts, list)
+        or not prompts
+        or any(not isinstance(prompt, str) for prompt in prompts)
+    ):
+        raise RoleRuntimeError("OMP runtime input context is unavailable")
+    files = re.findall(r'<file path="([^"]+)">\n(.*?)\n</file>', "\n".join(prompts), re.DOTALL)
+    input_file = _supplied_input_file(execution)
+    expected = [input_file] if input_file is not None else []
+    expected_prompt = execution.system_prompt
+    if expected:
+        path, content = expected[0]
+        expected_prompt += (
+            f'\n<project>\n## Context\n<instructions>\n<file path="{path}">\n'
+            f"{content}\n</file>\n</instructions>\n</project>"
+        )
+    if files != expected or prompts[0] != expected_prompt:
+        raise RoleRuntimeError("OMP loaded context differs from the isolated treatment")
+    tools = data.get("dumpTools")
+    if not isinstance(tools, list) or {
+        tool.get("name") for tool in tools if isinstance(tool, Mapping)
+    } != set(execution.tools):
+        raise RoleRuntimeError("OMP loaded tools differ from frozen permissions")
+
+
+@dataclass(slots=True)
+class _NativeApprovals:
+    """Serialize native approval responses, never preparation or capped hook handlers."""
+
+    enabled: bool
+    failure: str | None = None
+    started: dict[str, str] = field(default_factory=dict)
+    requested: dict[str, str] = field(default_factory=dict)
+    seen_requests: set[str] = field(default_factory=set)
+    dialogs: deque[str] = field(default_factory=deque)
+    seen_dialogs: set[str] = field(default_factory=set)
+    completed: set[str] = field(default_factory=set)
+    active_dialog: str | None = None
+    active_call: str | None = None
+    observed: bool = False
+    ended: bool = False
+    abort_sent: bool = False
+
+    @staticmethod
+    def _call(event: Mapping[str, Any]) -> tuple[str, str]:
+        identity, name = event.get("toolCallId"), event.get("toolName")
+        if not isinstance(identity, str) or not identity or name not in _MUTATING_TOOLS:
+            raise RoleRuntimeError("OMP native admission has malformed call identity")
+        return identity, name
+
+    def _admission(self, event: Mapping[str, Any]) -> None:
+        if not self.enabled or event.get("origin") != "runtime_observer":
+            raise RoleRuntimeError("OMP native admission has an unexpected origin")
+        identity, name = self._call(event)
+        phase = event.get("phase")
+        if phase == "requested":
+            if identity in self.seen_requests:
+                raise RoleRuntimeError("OMP native admission request was repeated")
+            self.seen_requests.add(identity)
+            self.requested[identity] = name
+        elif phase == "admitted":
+            if (
+                self.active_dialog is None
+                or self.active_call is not None
+                or self.requested.get(identity) != name
+                or self.started.get(identity) != name
+            ):
+                raise RoleRuntimeError("OMP native approval resolution is uncorrelated")
+            del self.requested[identity]
+            self.active_call = identity
+        else:
+            raise RoleRuntimeError("OMP native mutator admission was rejected")
+
+    def _dialog(self, event: Mapping[str, Any]) -> None:
+        if event.get("method") in (
+            "notify",
+            "setStatus",
+            "setWidget",
+            "setTitle",
+            "set_editor_text",
+        ):
+            return
+        identity = event.get("id")
+        if (
+            not self.enabled
+            or event.get("method") != "select"
+            or event.get("options") != ["Approve", "Deny"]
+            or not isinstance(identity, str)
+            or not identity
+            or identity in self.seen_dialogs
+        ):
+            raise RoleRuntimeError("OMP native approval dialog is unexpected")
+        unbound = self.active_dialog is not None and self.active_call is None
+        if len(self.dialogs) + int(unbound) >= len(self.requested):
+            raise RoleRuntimeError("OMP native approval dialog lacks a request")
+        self.seen_dialogs.add(identity)
+        self.dialogs.append(identity)
+
+    def _start(self, event: Mapping[str, Any]) -> None:
+        if event.get("toolName") not in _MUTATING_TOOLS:
+            return
+        identity, name = self._call(event)
+        if identity in self.started:
+            raise RoleRuntimeError("OMP native mutator execution start was repeated")
+        self.started[identity] = name
+
+    def _completion(self, event: Mapping[str, Any]) -> None:
+        identity, name = self._call(event)
+        if identity != self.active_call or self.started.get(identity) != name:
+            raise RoleRuntimeError("OMP native mutator completion is uncorrelated")
+        if event.get("type") == "instruct_eval_tool_observation":
+            if self.observed or event.get("origin") != "runtime_observer":
+                raise RoleRuntimeError("OMP native workspace observation is uncorrelated")
+            self.observed = True
+        else:
+            if self.ended:
+                raise RoleRuntimeError("OMP native mutator execution end was repeated")
+            self.ended = True
+
+    def _next(self) -> tuple[dict[str, Any], ...]:
+        if self.active_call is not None and self.observed and self.ended:
+            self.completed.add(self.active_call)
+            self.active_call = self.active_dialog = None
+            self.observed = self.ended = False
+        if self.active_dialog is not None or not self.dialogs:
+            return ()
+        if any(self.started.get(identity) != name for identity, name in self.requested.items()):
+            return ()
+        self.active_dialog = self.dialogs.popleft()
+        return ({"type": "extension_ui_response", "id": self.active_dialog, "value": "Approve"},)
+
+    def _cancel(self, event: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+        if self.abort_sent and event.get("type") != "extension_ui_request":
+            return ()
+        identities = list(self.dialogs)
+        self.dialogs.clear()
+        identity = event.get("id")
+        if (
+            event.get("type") == "extension_ui_request"
+            and isinstance(identity, str)
+            and identity not in identities
+            and identity != self.active_dialog
+        ):
+            identities.append(identity)
+        commands: list[dict[str, Any]] = []
+        if not self.abort_sent:
+            commands.append({"type": "abort", "id": "native-approval-abort"})
+            self.abort_sent = True
+        commands.extend(
+            {"type": "extension_ui_response", "id": identity, "cancelled": True}
+            for identity in identities
+        )
+        return tuple(commands)
+
+    def _observe(self, event: Mapping[str, Any]) -> None:
+        match event.get("type"):
+            case "instruct_eval_tool_admission":
+                self._admission(event)
+            case "extension_ui_request":
+                self._dialog(event)
+            case "tool_execution_start":
+                self._start(event)
+            case "instruct_eval_tool_observation":
+                self._completion(event)
+            case "tool_execution_end":
+                if event.get("toolName") in _MUTATING_TOOLS:
+                    self._completion(event)
+            case "extension_error":
+                raise RoleRuntimeError("OMP native observer reported an extension error")
+            case "agent_end":
+                if (
+                    self.active_dialog
+                    or self.dialogs
+                    or self.requested
+                    or (set(self.started) != self.completed)
+                ):
+                    raise RoleRuntimeError("OMP native admission evidence is incomplete")
+
+    def commands(self, event: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+        if self.failure is not None:
+            return self._cancel(event)
+        try:
+            self._observe(event)
+            return self._next()
+        except RoleRuntimeError as error:
+            self.failure = str(error)
+            return self._cancel(event)
+
+
+@dataclass(slots=True)
+class _RpcCapture:
+    stdout: bytearray = field(default_factory=bytearray)
+    stderr: bytearray = field(default_factory=bytearray)
+    pending: bytearray = field(default_factory=bytearray)
+    observer_ready: bool = False
+    approvals: _NativeApprovals = field(default_factory=lambda: _NativeApprovals(False))
+
+    def observe_readiness(self, event: Mapping[str, Any]) -> None:
+        if event.get("type") == "instruct_eval_observer_ready":
+            if self.observer_ready or event != {
+                "type": "instruct_eval_observer_ready",
+                "origin": "runtime_observer",
+            }:
+                raise RoleRuntimeError("OMP workspace observer readiness is malformed")
+            self.observer_ready = True
+
+    def respond(self, event: Mapping[str, Any], pipe: IO[bytes]) -> None:
+        self.observe_readiness(event)
+        if not self.approvals.enabled:
+            return
+        commands = self.approvals.commands(event)
+        if commands:
+            pipe.write("".join(json.dumps(command) + "\n" for command in commands).encode("utf-8"))
+            pipe.flush()
+
+
+def _read_rpc_event(
+    child: subprocess.Popen[bytes], deadline: float, expected: str, capture: _RpcCapture
+) -> Mapping[str, Any]:
+    if child.stdin is None or child.stdout is None or child.stderr is None:
+        raise RoleRuntimeError("OMP RPC pipes are unavailable")
+    with selectors.DefaultSelector() as selector:
+        selector.register(child.stdout, selectors.EVENT_READ, capture.stdout)
+        selector.register(child.stderr, selectors.EVENT_READ, capture.stderr)
+        while selector.get_map():
+            while b"\n" in capture.pending:
+                end = capture.pending.index(b"\n")
+                event = _terminal_event(capture.pending[:end].decode("utf-8"))
+                del capture.pending[: end + 1]
+                capture.respond(event, child.stdin)
+                if event.get("type") == expected or (
+                    event.get("type") == "response" and event.get("id") == expected
+                ):
+                    return event
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("OMP context", 0)
+            for key, _ in selector.select(remaining):
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                key.data.extend(chunk)
+                if len(capture.stdout) + len(capture.stderr) > _MAX_TRANSPORT_BYTES:
+                    raise RoleRuntimeError("OMP transport exceeds the runtime bound")
+                if key.data is capture.stdout:
+                    capture.pending.extend(chunk)
+    raise RoleRuntimeError("OMP exited before the expected RPC event")
+
+
+def _communicate_omp(
+    child: subprocess.Popen[bytes], execution: OmpExecutionRequest, timeout: int
+) -> ExecutionResult:
+    if child.stdin is None:
+        raise RoleRuntimeError("OMP RPC input pipe is unavailable")
+    deadline = time.monotonic() + timeout
+    capture = _RpcCapture(approvals=_NativeApprovals(execution.observe_tools))
+    child.stdin.write(b'{"id":"input-context","type":"get_state"}\n')
+    child.stdin.flush()
+    context = _read_rpc_event(child, deadline, "input-context", capture)
+    _validate_runtime_context(context, execution)
+    if capture.observer_ready != execution.observe_tools:
+        raise RoleRuntimeError("OMP workspace observer was not loaded as requested")
+    command = json.dumps({"id": "subject-task", "type": "prompt", "message": execution.prompt})
+    child.stdin.write((command + "\n").encode("utf-8"))
+    child.stdin.flush()
+    try:
+        _read_rpc_event(child, deadline, "agent_end", capture)
+        stdout, stderr = child.communicate(timeout=max(0, deadline - time.monotonic()))
+    except (subprocess.TimeoutExpired, RoleRuntimeError):
+        if capture.approvals.failure is None:
+            raise
+        _stop(child)
+        stdout, stderr = child.communicate(timeout=5)
+    if child.returncode and capture.approvals.failure is None:
+        raise RoleRuntimeError(f"OMP call failed with exit code {child.returncode}")
+    return _terminal_output(
+        (bytes(capture.stdout) + stdout).decode("utf-8"),
+        (bytes(capture.stderr) + stderr).decode("utf-8"),
+        prompt=execution.prompt,
+        required=execution.expect_json,
+        context=_TerminalContext(
+            context, capture.approvals.failure, _supplied_input_file(execution)
+        ),
+    )
 
 
 def execute_omp(execution: OmpExecutionRequest) -> ExecutionResult:
@@ -812,49 +1426,50 @@ def execute_omp(execution: OmpExecutionRequest) -> ExecutionResult:
         dir=runtime_parent,
     ) as temporary:
         root = Path(temporary)
-        home = _prepare_runtime_home(root, profile)
+        home = _prepare_runtime_home(root, profile, execution.observe_tools)
+        observer = root / "observer.mjs" if execution.observe_tools else None
+        if observer is not None:
+            observer.write_bytes(Path(__file__).with_name("native_observer.mjs").read_bytes())
         destination = home / ".omp" / "natives" / runtime_version / native.name
         destination.parent.mkdir(parents=True)
         shutil.copy2(native, destination)
         broker = gateway = child = None
         credential: Path | None = None
+        gate_port = _port() if execution.observe_tools else None
         try:
             boundary = _start_gateway(executable, home)
             broker = boundary.broker
             gateway = boundary.gateway
             credential = boundary.credential
             _write_gateway_model(home, profile, boundary)
-            (root / "tmp").mkdir()
             child = subprocess.Popen(
                 _sandbox(
-                    _omp_argv(executable, profile, settings, execution),
+                    _omp_argv(executable, profile, settings, execution, observer),
                     execution.workspace,
                     home,
-                    (executable, destination),
+                    (
+                        executable,
+                        destination,
+                        *_python_runtime_reads(),
+                        *((observer,) if observer is not None else ()),
+                    ),
+                    _SandboxNetwork(
+                        outbound_ports=(int(boundary.url.rsplit(":", 1)[1]),),
+                        gate_port=gate_port,
+                    ),
                 ),
                 cwd=execution.workspace,
-                text=True,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=_runtime_environment(home, root),
+                env=_runtime_environment(home, gate_port),
                 start_new_session=True,
             )
             try:
-                stdout, stderr = child.communicate(timeout=settings.timeout)
+                return _communicate_omp(child, execution, settings.timeout)
             except subprocess.TimeoutExpired as error:
                 _stop(child)
                 raise RoleRuntimeError("OMP call timed out") from error
-            if child.returncode:
-                raise RoleRuntimeError(f"OMP call failed with exit code {child.returncode}")
-            text, outputs = _terminal_text(stdout, required=execution.expect_json)
-            return ExecutionResult(
-                text,
-                _role_json(text) if execution.expect_json else None,
-                outputs,
-                stdout,
-                stderr,
-            )
         finally:
             _stop(child)
             if credential is not None:
@@ -873,15 +1488,13 @@ def invoke_role(
         contract_text = contract.read_text(encoding="utf-8")
     except OSError as error:
         raise RoleRuntimeError(f"role contract is unreadable: {contract.name}") from error
-    prompt = "Return the required JSON object for this complete packet:\n" + json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    prompt = "Return the required JSON object for this complete packet:\n" + canonical_bytes(
+        payload
+    ).decode("utf-8")
     system_prompt = (
         "You are an internal machine function. Return only the requested JSON object; "
         "do not use a completion-response format.\n\n"
-        + contract_text
+        + contract_text.rstrip()
         + "\n\nThe supplied packet is complete. Return one JSON object now; do not ask "
         "for more data, describe your reasoning, or use a code fence."
     )
@@ -898,6 +1511,10 @@ def invoke_role(
                 True,
             )
         )
+    if result.protocol_failure is not None:
+        raise RoleRuntimeError(result.protocol_failure)
+    if not result.input_verified:
+        raise RoleRuntimeError("OMP input echoes do not match the supplied prompt")
     assert result.payload is not None
     return result.payload
 
@@ -980,11 +1597,20 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_public_fixture_files(public_files: Any, expected_files: Mapping[str, str]) -> None:
+    if not isinstance(public_files, Mapping) or any(
+        not isinstance(content, str)
+        or sha256(content.encode("utf-8")).hexdigest() != expected_files.get(path)
+        for path, content in public_files.items()
+    ):
+        raise RoleRuntimeError("public fixture files differ from the frozen manifest")
+
+
 def _witness_contract(fixture: Fixture) -> _WitnessContract:
     manifest = fixture.manifest
     evidence = fixture.evidence_contract
     if (
-        set(manifest) != {"schema", "files"}
+        set(manifest) != {"schema", "files", "public_files"}
         or manifest["schema"] != "instruct-eval-fixture-manifest-v1"
     ):
         raise RoleRuntimeError("fixture manifest is not canonical")
@@ -996,8 +1622,10 @@ def _witness_contract(fixture: Fixture) -> _WitnessContract:
             "observer_path",
             "verifier_command",
             "observer_command",
+            "observation_contract",
         }
         or evidence["schema"] != "instruct-eval-evidence-contract-v1"
+        or evidence["observation_contract"] != OBSERVATION_CONTRACT
     ):
         raise RoleRuntimeError("fixture evidence contract is not canonical")
     files = manifest["files"]
@@ -1014,6 +1642,7 @@ def _witness_contract(fixture: Fixture) -> _WitnessContract:
         ):
             raise RoleRuntimeError("fixture manifest entry is malformed")
         expected_files[item["path"]] = item["sha256"]
+    _validate_public_fixture_files(manifest["public_files"], expected_files)
     verifier_path = evidence["verifier_path"]
     observer_path = evidence["observer_path"]
     commands = (evidence["verifier_command"], evidence["observer_command"])
@@ -1036,19 +1665,20 @@ def _witness_contract(fixture: Fixture) -> _WitnessContract:
     )
 
 
-def _witness_changes(witness: ReachabilityWitness) -> list[Any]:
+def _witness_actions(witness: ReachabilityWitness) -> list[Any]:
     try:
-        changes = json.loads(witness.input_bytes)
+        actions = json.loads(witness.input_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RoleRuntimeError("witness input is not canonical JSON") from error
     if (
-        not isinstance(changes, Mapping)
-        or set(changes) != {"schema", "changes"}
-        or changes["schema"] != "instruct-eval-witness-input-v1"
-        or not isinstance(changes["changes"], list)
+        not isinstance(actions, Mapping)
+        or set(actions) != {"schema", "actions"}
+        or actions["schema"] != "instruct-eval-witness-input-v1"
+        or not isinstance(actions["actions"], list)
+        or canonical_bytes(actions) != witness.input_bytes
     ):
-        raise RoleRuntimeError("witness change-set is malformed")
-    return changes["changes"]
+        raise RoleRuntimeError("witness action sequence is malformed")
+    return actions["actions"]
 
 
 def _validate_frozen_fixture(
@@ -1074,13 +1704,12 @@ def _apply_witness_change(
     workspace: Path,
     fixture: Fixture,
     raw: Any,
-    changed_paths: list[str],
 ) -> None:
     if (
         not isinstance(raw, Mapping)
-        or set(raw) != {"path", "content"}
+        or set(raw) != {"tool", "path", "content"}
+        or raw["tool"] != "write"
         or not isinstance(raw["path"], str)
-        or raw["path"] in changed_paths
         or raw["path"] not in fixture.allowed_changed_paths
         or (raw["content"] is not None and not isinstance(raw["content"], str))
     ):
@@ -1098,7 +1727,6 @@ def _apply_witness_change(
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(raw["content"], encoding="utf-8")
-    changed_paths.append(raw["path"])
 
 
 def _actual_changed_paths(
@@ -1114,13 +1742,203 @@ def _actual_changed_paths(
     )
 
 
+@dataclass(slots=True)
+class _GateSnapshotServer:
+    workspace: Path
+    listener: socket.socket = field(init=False)
+    snapshots: list[WorkspaceSnapshot] = field(default_factory=list)
+    error: BaseException | None = None
+    _closed: threading.Event = field(default_factory=threading.Event)
+    _thread: threading.Thread = field(init=False)
+    _retained: int = 0
+
+    def __post_init__(self) -> None:
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.listener.bind(("127.0.0.1", 0))
+            self.listener.listen()
+            self.listener.settimeout(0.1)
+        except OSError as error:
+            self.listener.close()
+            raise RoleRuntimeError("gate snapshot server could not bind") from error
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    @property
+    def port(self) -> int:
+        return int(self.listener.getsockname()[1])
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def close(self) -> None:
+        self._closed.set()
+        self.listener.close()
+        self._thread.join(timeout=1)
+        if self._thread.is_alive():
+            raise RoleRuntimeError("gate snapshot server did not terminate")
+
+    def changed_paths(self, final: WorkspaceSnapshot) -> list[dict[str, Any]]:
+        if self.error is not None:
+            raise RoleRuntimeError("gate snapshot server failed") from self.error
+        return [
+            {
+                "script": "check.py",
+                "changed_paths": list(_actual_changed_paths(snapshot, final)),
+            }
+            for snapshot in self.snapshots
+        ]
+
+    def _observe_connection(self, connection: socket.socket) -> None:
+        connection.settimeout(1)
+        payload = bytearray()
+        while not payload.endswith(b"\n"):
+            chunk = connection.recv(4096)
+            if not chunk:
+                raise RoleRuntimeError("gate snapshot request is incomplete")
+            payload.extend(chunk)
+            if len(payload) > _MAX_RESULT_TEXT_BYTES:
+                raise RoleRuntimeError("gate snapshot request exceeds the runtime bound")
+        if payload != b'{"script":"check.py"}\n':
+            raise RoleRuntimeError("gate snapshot request is malformed")
+        snapshot = snapshot_workspace(self.workspace)
+        retained = sum(
+            len(path.encode("utf-8")) + len(content.encode("utf-8"))
+            for path, content in snapshot.files.items()
+        ) + sum(len(path.encode("utf-8")) for path in snapshot.directories)
+        self._retained += retained
+        if self._retained > _MAX_EVIDENCE_BYTES:
+            raise RoleRuntimeError("gate snapshots exceed the evidence bound")
+        self.snapshots.append(snapshot)
+        connection.sendall(b"ok\n")
+
+    def _serve(self) -> None:
+        try:
+            while not self._closed.is_set():
+                try:
+                    connection, _ = self.listener.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    if not self._closed.is_set():
+                        raise
+                    return
+                with connection:
+                    self._observe_connection(connection)
+        except BaseException as error:
+            self.error = error
+
+
+@contextlib.contextmanager
+def _gate_snapshot_server(workspace: Path) -> Generator[_GateSnapshotServer]:
+    server = _GateSnapshotServer(workspace)
+    server.start()
+    try:
+        yield server
+    finally:
+        server.close()
+
+
+def _witness_bash(
+    workspace: Path,
+    home: Path,
+    command: str,
+    gate_port: int,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            _sandbox(
+                ["/bin/bash", "--noprofile", "--norc", "-c", command],
+                workspace,
+                home,
+                _python_runtime_reads(),
+                _SandboxNetwork(outbound_ports=(gate_port,)),
+            ),
+            cwd=workspace,
+            env=_runtime_environment(home, gate_port),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RoleRuntimeError("witness action timed out") from error
+    _bounded_evidence(result.stdout, "witness action stdout")
+    _bounded_evidence(result.stderr, "witness action stderr")
+    return result
+
+
+def _execute_witness_actions(
+    workspace: Path, fixture: Fixture, actions: Sequence[Any]
+) -> dict[str, Any]:
+    events: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(prefix="runtime-", dir=workspace.parent) as temporary:
+        home = _prepare_runtime_home(Path(temporary), "witness")
+        for index, action in enumerate(actions):
+            if not isinstance(action, Mapping):
+                raise RoleRuntimeError("witness action is malformed")
+            if action.get("tool") == "write":
+                before = snapshot_workspace(workspace)
+                _apply_witness_change(workspace, fixture, action)
+                events.append(
+                    {
+                        "tool": "write",
+                        "arguments": {"path": action["path"], "content": action["content"]},
+                        "is_error": False,
+                        "exit_code": None,
+                        "gate_snapshots": [],
+                    }
+                )
+            elif (
+                set(action) == {"tool", "command"}
+                and action["tool"] == "bash"
+                and isinstance(action["command"], str)
+                and action["command"]
+            ):
+                before = snapshot_workspace(workspace)
+                with _gate_snapshot_server(workspace) as snapshots:
+                    result = _witness_bash(workspace, home, action["command"], snapshots.port)
+                    gate_snapshots = snapshots.changed_paths(snapshot_workspace(workspace))
+                events.append(
+                    {
+                        "tool": "bash",
+                        "arguments": {"command": action["command"]},
+                        "is_error": result.returncode != 0,
+                        "exit_code": result.returncode,
+                        "gate_snapshots": gate_snapshots,
+                    }
+                )
+            elif set(action) == {"tool", "response"} and action["tool"] == "respond":
+                if index != len(actions) - 1:
+                    raise RoleRuntimeError("witness respond action must be last")
+                response_bytes = canonical_bytes(action["response"])
+                if len(response_bytes) > _MAX_RESULT_TEXT_BYTES:
+                    raise RoleRuntimeError("witness response exceeds the runtime bound")
+                try:
+                    response = decode_completion_response(response_bytes.decode("utf-8"))
+                except BehaviorError as error:
+                    raise RoleRuntimeError(f"witness response is malformed: {error}") from error
+                return {
+                    "origin": "witness",
+                    "terminal": "witness_return",
+                    "response": response,
+                    "events": events,
+                }
+            else:
+                raise RoleRuntimeError("witness action is malformed")
+            events[-1]["changed_paths"] = list(
+                _actual_changed_paths(before, snapshot_workspace(workspace))
+            )
+    raise RoleRuntimeError("witness requires one final respond action")
+
+
 def _run_witness_commands(
     commands: Sequence[Sequence[str]],
     workspace: Path,
+    observation: Mapping[str, Any],
 ) -> _WitnessEvidence:
     tool_hashes: dict[str, str] = {}
     results: list[subprocess.CompletedProcess[str]] = []
-    for command in commands:
+    for index, command in enumerate(commands):
         executable = shutil.which(command[0])
         if executable is None:
             raise RoleRuntimeError("witness evidence tool is unavailable")
@@ -1129,7 +1947,7 @@ def _run_witness_commands(
             result = subprocess.run(
                 command,
                 cwd=workspace,
-                stdin=subprocess.DEVNULL,
+                input=json.dumps(observation) if index == 1 else "",
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -1180,15 +1998,13 @@ def run_witness(
 ) -> WitnessExecutionResult:
     """Execute one condition-independent witness against a clean frozen fixture."""
     contract = _witness_contract(fixture)
-    changes = _witness_changes(witness)
+    actions = _witness_actions(witness)
     with _experiment_directory("witness", witness.witness_id) as experiment:
         workspace = experiment / "workspace"
         shutil.copytree(fixture_root, workspace, symlinks=True)
         before = snapshot_workspace(workspace)
         _validate_frozen_fixture(before, fixture, contract)
-        changed_paths: list[str] = []
-        for raw in changes:
-            _apply_witness_change(workspace, fixture, raw, changed_paths)
+        observation = _execute_witness_actions(workspace, fixture, actions)
         after = snapshot_workspace(workspace)
         actual_changed = _actual_changed_paths(before, after)
         protected = {
@@ -1200,8 +2016,17 @@ def run_witness(
             for path in protected
             if (workspace / path).is_file()
         }
-        evidence = _run_witness_commands(contract.commands, workspace)
-        observer = _witness_observer(evidence.results[1].stdout)
+        evidence = _run_witness_commands(contract.commands, workspace, observation)
+        if any(event["tool"] == "bash" for event in observation["events"]):
+            evidence = _WitnessEvidence(
+                evidence.results,
+                {**evidence.tool_hashes, "/bin/bash": _sha256_file(Path("/bin/bash"))},
+            )
+        observer = (
+            _witness_observer(evidence.results[1].stdout)
+            if evidence.results[1].returncode == 0
+            else {}
+        )
         return WitnessExecutionResult(
             unchanged,
             actual_changed,
@@ -1262,12 +2087,33 @@ def _run_subject_observers(
 ) -> SubjectResult | Mapping[str, str]:
     observer_output: dict[str, str] = {}
     verifier_passed = observation.verifier.returncode == 0
+    try:
+        observer_input = json.dumps(
+            project_subject_evidence(
+                observation.capture.execution.output_events,
+                observation.capture.execution.text,
+            )
+        )
+    except BehaviorError as error:
+        return observation.capture.result(
+            _subject_outcome(
+                _SubjectOutcomeRequest(
+                    False,
+                    verifier_passed,
+                    f"subject behavior evidence failed: {error}",
+                    observation.capture.execution.text,
+                    observation.evidence,
+                    observer_output,
+                    observation.verifier,
+                )
+            )
+        )
     for item in observation.observer_paths:
         try:
             observed = subprocess.run(
                 ["python3", item],
                 cwd=observation.workspace,
-                stdin=subprocess.DEVNULL,
+                input=observer_input,
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -1344,6 +2190,16 @@ def _prepare_subject_run(
     workspace: Path,
     subject: _SubjectRequest,
 ) -> _SubjectRun | SubjectResult:
+    if any(
+        path.name in {"AGENTS.md", "CLAUDE.md", "GEMINI.md", "RULES.md", "SYSTEM.md"}
+        or ".omp" in path.relative_to(workspace).parts
+        for path in workspace.rglob("*")
+    ):
+        raise RoleRuntimeError("frozen fixture contains runtime context files")
+    if subject.condition == "B":
+        context_file = workspace / ".omp" / "AGENTS.md"
+        context_file.parent.mkdir()
+        context_file.write_text(str(subject.request["candidate_instruction"]), encoding="utf-8")
     try:
         before = snapshot_workspace(workspace)
     except RoleRuntimeError as error:
@@ -1361,19 +2217,15 @@ def _prepare_subject_run(
     if not verifier_path.is_file():
         raise RoleRuntimeError("public fixture verifier is unavailable")
     protected = {"verify.py": _sha256_file(verifier_path)}
+    if subject.condition == "B":
+        protected[".omp/AGENTS.md"] = _sha256_file(workspace / ".omp" / "AGENTS.md")
     for item in subject.observer_paths:
         path = workspace / item
         if not path.is_file():
             raise RoleRuntimeError("public fixture observer is unavailable")
         protected[item] = _sha256_file(path)
     task = (workspace / "TASK.txt").read_text(encoding="utf-8")
-    prompt = task + (
-        "\n\nApply this additional instruction while completing the task:\n"
-        + str(subject.request["candidate_instruction"])
-        if subject.condition == "B"
-        else ""
-    )
-    return _SubjectRun(subject, workspace, before, protected, prompt)
+    return _SubjectRun(subject, workspace, before, protected, task)
 
 
 def _execute_subject(run: _SubjectRun) -> _SubjectCapture | SubjectResult:
@@ -1384,9 +2236,12 @@ def _execute_subject(run: _SubjectRun) -> _SubjectCapture | SubjectResult:
                 run.prompt,
                 run.subject.request,
                 "Complete the supplied task in the workspace. Do not describe an "
-                "experiment. Use only the permitted tools.",
+                "experiment. Use only the permitted tools. Your final response must be one "
+                'JSON object with exactly "completion" ("complete" or "incomplete") and '
+                '"summary" (a string describing the outcome). Do not use a code fence.',
                 run.subject.request["permissions"]["tools"],
                 False,
+                observe_tools=True,
             )
         )
     except RoleRuntimeError as error:
@@ -1442,6 +2297,22 @@ def _finalize_subject(
     capture: _SubjectCapture,
     evidence: _SubjectEvidence,
 ) -> SubjectResult:
+    failure = capture.execution.protocol_failure
+    if failure is None and not capture.execution.input_verified:
+        failure = "OMP input echoes do not match the supplied prompt"
+    if failure is not None:
+        return capture.result(
+            _subject_outcome(
+                _SubjectOutcomeRequest(
+                    False,
+                    False,
+                    failure,
+                    capture.execution.text,
+                    evidence,
+                    {},
+                )
+            )
+        )
     if evidence.unchanged != run.protected:
         return capture.result(
             _subject_outcome(
@@ -1538,7 +2409,7 @@ def run_subject(
         isolated_request,
         observer_paths,
     )
-    with _experiment_directory("subject", assignment) as experiment:
+    with _experiment_directory("subject") as experiment:
         workspace = experiment / "workspace"
         shutil.copytree(subject.fixture, workspace, symlinks=True)
         prepared = _prepare_subject_run(workspace, subject)

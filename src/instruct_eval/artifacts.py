@@ -215,11 +215,11 @@ class ArtifactStore:
         _fsync_directory(destination.parent)
 
     def _make_parent(self, parent: Path) -> None:
-        root = (
-            self.private_root
-            if self.private_root == parent or self.private_root in parent.parents
-            else self.root
-        )
+        root = self.root
+        if not self._public_only and (
+            self.private_root == parent or self.private_root in parent.parents
+        ):
+            root = self.private_root
         current = root
         for part in parent.relative_to(root).parts:
             current = current / part

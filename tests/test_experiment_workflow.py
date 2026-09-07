@@ -6,6 +6,7 @@ import pytest
 
 from instruct_eval.activities import ActivityResult, GateResult
 from instruct_eval.models import canonical_hash
+from instruct_eval.trials import ASSIGNMENT_IDS, authorization_rule
 from instruct_eval.workflows import (
     ExperimentGate,
     ExperimentInput,
@@ -104,7 +105,7 @@ class _SubjectActivityFailureHarness:
         self.experiment = experiment
         self.executed: list[tuple[str, object]] = []
         self.committed: list[str] = []
-        self.tokens = tuple(f"{index:043d}" for index in range(10))
+        self.tokens = tuple(f"{index:043d}" for index in range(len(ASSIGNMENT_IDS)))
         self.waits = 0
 
     async def execute(
@@ -128,7 +129,7 @@ class _SubjectActivityFailureHarness:
                 }
             )
         if name == "instruct_eval.eligibility":
-            return activity({"accepted": True})
+            return activity({"eligible": True})
         if name == "instruct_eval.map_lifecycle":
             return activity(
                 {
@@ -329,26 +330,21 @@ class ExperimentWorkflowStateTests(unittest.TestCase):
         assert result.status == "PROTOCOL_FAILURE"
 
     def test_canonical_g5_packet_and_non_authorized_g6_complete(self) -> None:
-        blind_ids = {f"blind-{index}" for index in range(10)}
+        blind_ids = {f"blind-{index}" for index in range(len(ASSIGNMENT_IDS))}
         released = {
             "assignments": [
                 {
                     "blind_id": f"blind-{index}",
-                    "scenario": "core-1",
-                    "condition": "A",
+                    "scenario": assignment.rsplit("-", 2)[0],
+                    "condition": assignment.rsplit("-", 2)[1],
                     "direction": "D",
                 }
-                for index in range(10)
+                for index, assignment in enumerate(ASSIGNMENT_IDS)
             ],
             "preferred_directions": {"core-1": "D", "core-2": "D", "negative-control": "D"},
-            "authorization_rule": {
-                "schema": "instruct-eval-authorization-rule-v1",
-                "core_scenarios": ["core-1", "core-2"],
-                "negative_control_scenario": "negative-control",
-                "core_comparison": "preferred_count_B_strictly_greater_than_A",
-                "negative_control_comparison": "both_subjects_match_preferred_direction",
-            },
+            "authorization_rule": authorization_rule(),
         }
+        released["assignments"].sort(key=lambda row: row["blind_id"])
         packet = {**released, "release_sha256": canonical_hash(released)}
         assert _g5_release(packet, blind_ids) == packet
         assert self.workflow._claim_authorization(

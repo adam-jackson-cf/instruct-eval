@@ -22,14 +22,24 @@ from .models import ExperimentDesign, ProtocolError, canonical_bytes
 ASSIGNMENT_IDS = (
     "core-1-A-1",
     "core-1-A-2",
+    "core-1-A-3",
+    "core-1-A-4",
     "core-1-B-1",
     "core-1-B-2",
+    "core-1-B-3",
+    "core-1-B-4",
     "core-2-A-1",
     "core-2-A-2",
+    "core-2-A-3",
+    "core-2-A-4",
     "core-2-B-1",
     "core-2-B-2",
+    "core-2-B-3",
+    "core-2-B-4",
     "negative-control-A-1",
+    "negative-control-A-2",
     "negative-control-B-1",
+    "negative-control-B-2",
 )
 SCENARIOS = ("core-1", "core-2", "negative-control")
 MAX_CHANNEL_BYTES = 2 * 1024 * 1024
@@ -327,7 +337,7 @@ def authorization_rule() -> dict[str, Any]:
         "core_scenarios": ["core-1", "core-2"],
         "negative_control_scenario": "negative-control",
         "core_comparison": "preferred_count_B_strictly_greater_than_A",
-        "negative_control_comparison": "both_subjects_match_preferred_direction",
+        "negative_control_comparison": "all_subjects_match_preferred_direction",
     }
 
 
@@ -1205,7 +1215,7 @@ def _validate_release_directions(mapping: FrozenPrivateMap, directions: Mapping[
         or set(directions) != expected_tokens
         or any(not isinstance(direction, str) or not direction for direction in directions.values())
     ):
-        raise TrialProtocolError("G5 directions must come from exactly ten private outcomes")
+        raise TrialProtocolError("G5 directions must cover every private outcome")
 
 
 def _released_assignments(
@@ -1330,11 +1340,8 @@ def _decode_channels(channels: Sequence[bytes]) -> str:
         raise TrialProtocolError("invalid UTF-8") from error
 
 
-def _validate_normalized_stream(normalized: str, channel_count: int) -> None:
-    if (
-        len(normalized) > MAX_NORMALIZED_SCALARS
-        or len(normalized) * channel_count > MAX_AGGREGATE_SCALARS
-    ):
+def _validate_normalized_stream(normalized: str) -> None:
+    if len(normalized) > min(MAX_NORMALIZED_SCALARS, MAX_AGGREGATE_SCALARS):
         raise TrialProtocolError("normalized stream overflow")
 
 
@@ -1345,7 +1352,7 @@ def scan_disclosure(*, raw: bytes | Sequence[bytes], treatment: str) -> bool:
     if any(raw_matcher.matches(channel) for channel in channels):
         return True
     normalized = normalize(_decode_channels(channels))
-    _validate_normalized_stream(normalized, len(channels))
+    _validate_normalized_stream(normalized)
     return bool(AhoMatcher(normalized_patterns(treatment)).matches(normalized)) or (
         condition_disclosure(normalized)
     )
@@ -1437,8 +1444,15 @@ def _g6_counts_valid(
     directions: Mapping[tuple[str, str], Sequence[str]],
     expected: set[tuple[str, str]],
 ) -> bool:
+    expected_counts = {
+        pair: sum(
+            assignment.rsplit("-", 2)[0] == pair[0] and assignment.rsplit("-", 2)[1] == pair[1]
+            for assignment in ASSIGNMENT_IDS
+        )
+        for pair in expected
+    }
     return all(
-        len(directions[(scenario, condition)]) == (2 if scenario != "negative-control" else 1)
+        len(directions[(scenario, condition)]) == expected_counts[(scenario, condition)]
         for scenario, condition in expected
     )
 
@@ -1457,8 +1471,9 @@ def _g6_negative_control_authorized(
     directions: Mapping[tuple[str, str], Sequence[str]], preferred: Mapping[str, str]
 ) -> bool:
     return all(
-        directions[("negative-control", condition)][0] == preferred["negative-control"]
+        direction == preferred["negative-control"]
         for condition in ("A", "B")
+        for direction in directions[("negative-control", condition)]
     )
 
 

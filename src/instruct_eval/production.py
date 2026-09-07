@@ -61,6 +61,7 @@ from .worker import (
     TEMPORAL_NAMESPACE,
     ActivityBackendRequest,
     DomainOperations,
+    DurableAuthoritySlots,
     InstructEvalActivityBackend,
     PrivateAuthorityResolver,
     PrivateMapAuthority,
@@ -126,7 +127,6 @@ def _public(value: Any) -> None:
         for key, child in value.items():
             if not isinstance(key, str) or key.lower().replace("-", "_") in {
                 "treatment",
-                "token",
                 "private",
             }:
                 raise ProtocolError("private data cannot enter a public operation")
@@ -152,6 +152,36 @@ def _gate(name: str, result: Mapping[str, Any], artifacts: ArtifactStore) -> Gat
     )
 
 
+def _decomposition_packet(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    if set(payload) != {"instruction"}:
+        raise ProtocolError("decomposition requires the exact instruction source")
+    instruction = payload["instruction"]
+    try:
+        return role_runtime.prepare_decomposition_packet(instruction)
+    except role_runtime.RoleRuntimeError as error:
+        raise ProtocolError("decomposition source hash is invalid") from error
+
+
+def _decomposition_output(
+    packet: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    if result.get("rejected") is True:
+        if set(result) != {"rejected", "reasons"}:
+            raise ProtocolError("decomposition rejection is malformed")
+        return result
+    if set(result) != {"provisional_groups", "source_classification"}:
+        raise ProtocolError("decomposition output is malformed")
+    try:
+        classification = SourceClassification.from_payload(result["source_classification"])
+    except ProtocolError as error:
+        raise ProtocolError("decomposition source classification is malformed") from error
+    if classification.source_sha256 != packet["source_sha256"]:
+        raise ProtocolError("decomposition source hash does not match instruction")
+    _source_partition(packet["instruction"], classification.coverage, ProtocolError)
+    return result
+
+
 def _role_output(
     name: str,
     payload: Mapping[str, Any],
@@ -161,11 +191,14 @@ def _role_output(
     contract = _ROLE_ROOT / _ROLE_FOR_OPERATION[name]
     if not contract.is_file() or contract.is_symlink():
         raise ProductionConfigurationError("role contract is unavailable")
-    result = runtime.invoke_role(contract, payload, role_request)
+    packet = _decomposition_packet(payload) if name == "decomposition" else payload
+    result = runtime.invoke_role(contract, packet, role_request)
     if not isinstance(result, Mapping):
         raise ProtocolError("role returned malformed output")
     public_result = dict(result)
     _public(public_result)
+    if name == "decomposition":
+        return _decomposition_output(packet, public_result)
     return public_result
 
 
@@ -178,8 +211,8 @@ def _exact_hashes(payload: Mapping[str, Any], fields: set[str], label: str) -> N
 
 
 def _blind_scores(value: Any) -> list[dict[str, str]]:
-    if not isinstance(value, list) or len(value) != 10:
-        raise ProtocolError("scorer must return exactly ten blind scores")
+    if not isinstance(value, list) or len(value) != len(ASSIGNMENT_IDS):
+        raise ProtocolError(f"scorer must return exactly {len(ASSIGNMENT_IDS)} blind scores")
     scores: list[dict[str, str]] = []
     blind_ids: set[str] = set()
     for score in value:
@@ -837,13 +870,33 @@ def _witness_executions(
     return executions, by_witness
 
 
-def _g0_assessment(artifacts: ArtifactStore, proposal: DesignProposal) -> Mapping[str, Any]:
-    g0 = json.loads(
-        artifacts.read_bytes(
-            f"public/gates/g0_commit/sha256/{proposal.g0_commit_hash}.json",
-            ArtifactMode.PUBLIC,
-        )
+def _g0_assessment(slots: _OperationSlots, proposal: DesignProposal) -> Mapping[str, Any]:
+    workflow_id, run_id = _activity_execution_identity()
+    ledger_bytes = slots.artifacts.read_bytes(
+        f"campaigns/{slots.request.campaign_id}/{slots.request.experiment_id}/"
+        f"{workflow_id}/{run_id}/ledger/000-g0_commit.json",
+        ArtifactMode.PUBLIC,
     )
+    ledger = json.loads(ledger_bytes)
+    if (
+        sha256(ledger_bytes).hexdigest() != proposal.g0_commit_hash
+        or not isinstance(ledger, Mapping)
+        or ledger.get("schema") != "instruct-eval-ledger-v1"
+        or ledger.get("gate") != "g0_commit"
+        or ledger.get("workflow_id") != workflow_id
+        or ledger.get("run_id") != run_id
+        or ledger.get("ordinal") != 0
+        or ledger.get("status") != "PUBLISHED"
+    ):
+        raise ProtocolError("G2 analyst assessment ledger is not the signed G0 record")
+    artifact_hash = _digest(ledger.get("public_artifact_sha256"), "G0 public artifact hash")
+    artifact_bytes = slots.artifacts.read_bytes(
+        f"public/gates/g0_commit/sha256/{artifact_hash}.json",
+        ArtifactMode.PUBLIC,
+    )
+    if sha256(artifact_bytes).hexdigest() != artifact_hash:
+        raise ProtocolError("G2 analyst assessment artifact differs from the G0 ledger")
+    g0 = json.loads(artifact_bytes)
     eligibility = g0.get("eligibility") if isinstance(g0, Mapping) else None
     if (
         not isinstance(g0, Mapping)
@@ -874,7 +927,7 @@ def _pre_run_review(
         "schema": "instruct-eval-adversary-review-packet-v1",
         "claim": claim,
         "treatment": treatment.payload(),
-        "analyst_assessment": _g0_assessment(slots.artifacts, proposal),
+        "analyst_assessment": _g0_assessment(slots, proposal),
         "experiment_design": design.payload(),
         "witness_executions": executions,
     }
@@ -914,7 +967,7 @@ def _pre_run_result(slots: _OperationSlots, payload: Mapping[str, Any]) -> Mappi
             "schema": "instruct-eval-adversary-review-packet-v1",
             "claim": claim,
             "treatment": treatment.payload(),
-            "analyst_assessment": _g0_assessment(slots.artifacts, proposal),
+            "analyst_assessment": _g0_assessment(slots, proposal),
             "experiment_design": design.payload(),
             "witness_executions": _witness_executions(
                 design,
@@ -927,6 +980,36 @@ def _pre_run_result(slots: _OperationSlots, payload: Mapping[str, Any]) -> Mappi
     accepted = review["adversary_decision"]["accepted"]
     if accepted is False and not review["rejections"]:
         raise ProtocolError("G2 rejection requires concrete defects")
+    if accepted:
+        slots.artifacts.publish_json(
+            f"scoring/{slots.request.campaign_id}/{slots.request.experiment_id}/"
+            f"{proposal.design_hash}.json",
+            {
+                "design_sha256": proposal.design_hash,
+                "fixtures": [
+                    {
+                        "fixture_id": fixture.fixture_id,
+                        "axes": [
+                            {"name": axis.name, "values": list(axis.values)}
+                            for axis in fixture.axes
+                        ],
+                        "directions": [
+                            {"code": direction.code, "description": direction.description}
+                            for direction in fixture.directions
+                        ],
+                        "outcome_table": [
+                            {"outcome": list(key), "direction": direction}
+                            for key, direction in sorted(
+                                fixture.outcome_table.items(),
+                                key=lambda item: canonical_bytes(list(item[0])),
+                            )
+                        ],
+                    }
+                    for fixture in design.fixtures
+                ],
+            },
+            ArtifactMode.PUBLIC,
+        )
     return {
         "schema": "instruct-eval-g2-pre-run-validity-v1",
         "accepted": accepted,
@@ -971,8 +1054,8 @@ def _freeze_result(slots: _OperationSlots, payload: Mapping[str, Any]) -> Mappin
         or not isinstance(payload["map_ref"], str)
         or not isinstance(payload["map_commitment"], str)
         or not isinstance(tokens, (list, tuple))
-        or len(tokens) != 10
-        or len(set(tokens)) != 10
+        or len(tokens) != len(ASSIGNMENT_IDS)
+        or len(set(tokens)) != len(ASSIGNMENT_IDS)
     ):
         raise ProtocolError("freeze commitment is malformed")
     for value in (
@@ -1006,7 +1089,7 @@ def _valid_accounting(accounting: Any) -> bool:
     }
     return (
         isinstance(accounting, (list, tuple))
-        and len(accounting) == 10
+        and len(accounting) == len(ASSIGNMENT_IDS)
         and all(
             isinstance(entry, Mapping)
             and set(entry) == {"token", "disposition"}
@@ -1014,7 +1097,7 @@ def _valid_accounting(accounting: Any) -> bool:
             and entry["disposition"] in dispositions
             for entry in accounting
         )
-        and len({entry["token"] for entry in accounting}) == 10
+        and len({entry["token"] for entry in accounting}) == len(ASSIGNMENT_IDS)
     )
 
 
@@ -1046,7 +1129,9 @@ def _execution_result(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     ):
         raise ProtocolError("G3 execution commitment is malformed")
     passed = payload["verifier_passed"]
-    accepted = len(outcomes) == 10 and all(entry["disposition"] == "result" for entry in accounting)
+    accepted = len(outcomes) == len(ASSIGNMENT_IDS) and all(
+        entry["disposition"] == "result" for entry in accounting
+    )
     if (
         payload["outcomes_sha256"] != canonical_hash({"outcome_sha256s": outcomes})
         or not isinstance(payload["protocol_valid"], bool)
@@ -1068,9 +1153,39 @@ def _execution_result(payload: Mapping[str, Any]) -> Mapping[str, Any]:
 
 def _evidence_result(slots: _OperationSlots, payload: Mapping[str, Any]) -> Mapping[str, Any]:
     _exact_hashes(payload, {"design_sha256", "outcomes"}, "scorer")
-    if not isinstance(payload["outcomes"], list) or len(payload["outcomes"]) != 10:
+    if not isinstance(payload["outcomes"], list) or len(payload["outcomes"]) != len(ASSIGNMENT_IDS):
         raise ProtocolError("scorer outcomes are malformed")
-    scorer = _role_output("evidence_audit", payload, slots.runtime, slots.role_request)
+    scoring = json.loads(
+        slots.artifacts.read_bytes(
+            f"scoring/{slots.request.campaign_id}/{slots.request.experiment_id}/"
+            f"{payload['design_sha256']}.json",
+            ArtifactMode.PUBLIC,
+        )
+    )
+    if (
+        not isinstance(scoring, Mapping)
+        or set(scoring) != {"design_sha256", "fixtures"}
+        or scoring["design_sha256"] != payload["design_sha256"]
+        or not isinstance(scoring["fixtures"], list)
+        or len(scoring["fixtures"]) != 3
+    ):
+        raise ProtocolError("scorer frozen fixtures are malformed")
+    outcome_fields = {"blind_id", "fixture", "verifier_passed", "observer_state"}
+    outcomes = []
+    for outcome in payload["outcomes"]:
+        if (
+            not isinstance(outcome, Mapping)
+            or outcome.get("protocol_valid") is not True
+            or not outcome_fields <= outcome.keys()
+        ):
+            raise ProtocolError("scorer outcomes are malformed")
+        outcomes.append({field: outcome[field] for field in outcome_fields})
+    scorer = _role_output(
+        "evidence_audit",
+        {"fixtures": scoring["fixtures"], "outcomes": outcomes},
+        slots.runtime,
+        slots.role_request,
+    )
     if set(scorer) != {"blind_scores"}:
         raise ProtocolError("scorer output is not the canonical blind_scores packet")
     return {"blind_scores": _blind_scores(scorer["blind_scores"])}
@@ -1135,7 +1250,7 @@ def _g0_result(payload: Mapping[str, Any]) -> Mapping[str, Any]:
         set(payload) != {"gate", "eligibility", "accepted"}
         or payload["gate"] != "G0"
         or not isinstance(payload["eligibility"], Mapping)
-        or payload["accepted"] is not (payload["eligibility"].get("accepted") is True)
+        or payload["accepted"] is not (payload["eligibility"].get("eligible") is True)
     ):
         raise ProtocolError("G0 acceptance must derive from exact eligibility output")
     return {"schema": "instruct-eval-g0-commit-v1", **payload}
@@ -1218,20 +1333,6 @@ def concrete_domain_operations(
             for name in DomainOperations.__dataclass_fields__
         }
     )
-
-
-@dataclass(frozen=True, slots=True)
-class DurableAuthoritySlots:
-    """Durable identities and source material for one child authority issuance."""
-
-    coordination: CoordinationStore
-    campaign_id: str
-    experiment_id: str
-    workflow_id: str
-    run_id: str
-    parent_workflow_id: str
-    parent_run_id: str
-    candidate_instruction: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1657,6 +1758,26 @@ class ArtifactPrivateAuthority(PrivateAuthorityResolver):
             raise ProductionConfigurationError("child authority payload is malformed") from error
 
 
+def _invalid_subject_payload(private_artifacts: dict[str, Any], reason: str) -> Mapping[str, Any]:
+    private_artifacts["trusted_logs"]["reason"] = reason
+    return {
+        "outcome": {"protocol_valid": False},
+        "private_artifacts": private_artifacts,
+    }
+
+
+def _disclosure_failure_reason(channels: Sequence[str], treatment: str) -> str | None:
+    try:
+        if scan_disclosure(
+            raw=tuple(channel.encode("utf-8") for channel in channels),
+            treatment=treatment,
+        ):
+            return "subject evidence disclosed treatment or protocol labels"
+    except TrialProtocolError as error:
+        return str(error)
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeSubjectExecutor:
     fixture_roots: Mapping[str, Path]
@@ -1684,6 +1805,17 @@ class RuntimeSubjectExecutor:
             raise TrialProtocolError("private subject configuration is unavailable")
         if not isinstance(frozen_design, ExperimentDesign):
             raise TrialProtocolError("subject frozen design is unavailable")
+        try:
+            frozen_fixture = next(
+                item for item in frozen_design.fixtures if item.fixture_id == assignment.scenario
+            )
+            observer_path = frozen_fixture.evidence_contract["observer_path"]
+            if not isinstance(observer_path, str) or not observer_path:
+                raise KeyError("observer_path")
+        except (KeyError, StopIteration) as error:
+            raise TrialProtocolError(
+                "subject observer outcome is not a frozen fixture outcome"
+            ) from error
         subject_request = dict(self.request)
         if treatment is not None:
             subject_request["candidate_instruction"] = treatment
@@ -1692,85 +1824,86 @@ class RuntimeSubjectExecutor:
             assignment.condition,
             fixture,
             subject_request,
-            observer_paths=self.fixture_paths.get(assignment.scenario, ()),
+            observer_paths=(observer_path,),
         )
+        private_artifacts: dict[str, Any] = {
+            "response": result.response,
+            "runtime_streams": {
+                "stdout": result.runtime_stdout,
+                "stderr": result.runtime_stderr,
+                "output_events": result.runtime_output_events,
+            },
+            "tool_outputs": list(result.tool_outputs),
+            "diff": result.changes,
+            "verifier": {
+                "passed": result.verifier_passed,
+                "stdout": result.verifier_stdout,
+                "stderr": result.verifier_stderr,
+            },
+            "observer": dict(result.observer_output),
+            "trusted_logs": {
+                "reason": result.reason,
+                "unchanged_hashes": dict(result.unchanged_hashes),
+            },
+        }
+
         raw_channels = (
             result.response,
             result.changes,
-            *result.tool_outputs,
-            result.runtime_stdout,
+            *result.disclosure_tool_outputs,
+            result.runtime_output_events,
             result.runtime_stderr,
             result.verifier_stdout,
             result.verifier_stderr,
             *result.observer_output.values(),
         )
-        if scan_disclosure(
-            raw=tuple(channel.encode("utf-8") for channel in raw_channels),
-            treatment=disclosure_treatment,
-        ):
-            raise TrialProtocolError("subject evidence disclosed treatment or protocol labels")
+        disclosure_failure = _disclosure_failure_reason(raw_channels, disclosure_treatment)
+        if disclosure_failure is not None:
+            return _invalid_subject_payload(private_artifacts, disclosure_failure)
         if not result.protocol_valid:
-            raise TrialProtocolError("subject execution was protocol-invalid")
+            return _invalid_subject_payload(
+                private_artifacts, result.reason or "subject execution was protocol-invalid"
+            )
         try:
             observed = construct_outcome_tuple(
                 frozen_design,
                 assignment.scenario,
                 result.verifier_passed,
-                result.observer_output,
+                json.loads(result.observer_output[observer_path]),
                 protocol_valid=result.protocol_valid,
-            )
-            frozen_fixture = next(
-                item for item in frozen_design.fixtures if item.fixture_id == assignment.scenario
             )
             direction_code = frozen_fixture.outcome_table[
                 (observed.verifier_passed, *observed.axis_values)
             ]
-        except (ProtocolError, KeyError, StopIteration) as error:
-            raise TrialProtocolError(
-                "subject observer outcome is not a frozen fixture outcome"
-            ) from error
-        changed = {
-            line.split("file/", 1)[1] if "file/" in line else line.split("/", 1)[1]
-            for line in result.changes.splitlines()
-            if line.startswith(
-                ("+++ created file/", "--- removed file/", "--- before/", "+++ after/")
+            changed = {
+                line.split("file/", 1)[1] if "file/" in line else line.split("/", 1)[1]
+                for line in result.changes.splitlines()
+                if line.startswith(
+                    ("+++ created file/", "--- removed file/", "--- before/", "+++ after/")
+                )
+            }
+            outcome = closed_outcome(
+                ClosedOutcomeParams(
+                    blind_id=assignment.blind_id,
+                    fixture=assignment.scenario,
+                    verifier_passed=observed.verifier_passed,
+                    observer_state=observed.axis_values,
+                    direction_code=direction_code,
+                    changed_paths=tuple(sorted(changed)),
+                    token=assignment.token,
+                    k_evidence=self.evidence_key,
+                    fixture_paths=self.fixture_paths,
+                    root=fixture,
+                )
             )
-        }
-        outcome = closed_outcome(
-            ClosedOutcomeParams(
-                blind_id=assignment.blind_id,
-                fixture=assignment.scenario,
-                verifier_passed=observed.verifier_passed,
-                observer_state=observed.axis_values,
-                direction_code=direction_code,
-                changed_paths=tuple(sorted(changed)),
-                token=assignment.token,
-                k_evidence=self.evidence_key,
-                fixture_paths=self.fixture_paths,
-                root=fixture,
+        except (ProtocolError, KeyError, json.JSONDecodeError) as error:
+            return _invalid_subject_payload(
+                private_artifacts,
+                f"subject observer outcome is not a frozen fixture outcome: {error}",
             )
-        )
         return {
             "outcome": outcome,
-            "private_artifacts": {
-                "response": result.response,
-                "runtime_streams": {
-                    "stdout": result.runtime_stdout,
-                    "stderr": result.runtime_stderr,
-                },
-                "tool_outputs": list(result.tool_outputs),
-                "diff": result.changes,
-                "verifier": {
-                    "passed": result.verifier_passed,
-                    "stdout": result.verifier_stdout,
-                    "stderr": result.verifier_stderr,
-                },
-                "observer": dict(result.observer_output),
-                "trusted_logs": {
-                    "reason": result.reason,
-                    "unchanged_hashes": dict(result.unchanged_hashes),
-                },
-            },
+            "private_artifacts": private_artifacts,
         }
 
 

@@ -9,14 +9,21 @@ from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from instruct_eval.activities import ActivityRequest, GatePublication, GateRequest
+from instruct_eval import production
+from instruct_eval.activities import (
+    ActivityRequest,
+    GatePublication,
+    GateRequest,
+    InstructEvalActivities,
+)
 from instruct_eval.artifacts import ArtifactError, ArtifactMode, ArtifactStore
+from instruct_eval.behavior import OBSERVATION_CONTRACT
 from instruct_eval.coordination import (
     ChildAuthorizationClaimRequest,
     ChildAuthorizationRequest,
@@ -45,7 +52,6 @@ from instruct_eval.models import (
 )
 from instruct_eval.production import (
     ArtifactPrivateAuthority,
-    DurableAuthoritySlots,
     ProductionConfig,
     ProductionConfigurationError,
     PublicProductionConfig,
@@ -63,7 +69,56 @@ from instruct_eval.signing import (
     StageAttestationSigningParameters,
     public_key_base64url,
 )
-from instruct_eval.trials import PrivateAssignment, authorization_rule
+from instruct_eval.trials import (
+    ASSIGNMENT_IDS,
+    MAX_NORMALIZED_SCALARS,
+    SUBJECT_ARTIFACT_KINDS,
+    PrivateAssignment,
+    authorization_rule,
+    normalize,
+    scan_disclosure,
+)
+from instruct_eval.worker import DurableAuthoritySlots
+
+
+def _assert_retained_invalid_subject(result) -> None:
+    assert result["outcome"] == {"protocol_valid": False}
+    private_artifacts = result["private_artifacts"]
+    assert set(private_artifacts) == SUBJECT_ARTIFACT_KINDS - {"outcome"}
+    assert isinstance(private_artifacts["trusted_logs"]["reason"], str)
+    events = [
+        json.loads(line) for line in private_artifacts["runtime_streams"]["stdout"].splitlines()
+    ]
+    terminal = next(event for event in events if event["type"] == "agent_end")
+    assert private_artifacts["response"] == "".join(
+        block["text"] for block in terminal["messages"][-1]["content"] if block["type"] == "text"
+    )
+
+
+def _assert_valid_subject_artifacts(result: Mapping[str, Any], treatment: str | None) -> None:
+    private_artifacts = result["private_artifacts"]
+    assert set(private_artifacts) == SUBJECT_ARTIFACT_KINDS - {"outcome"}
+    outcome = result["outcome"]
+    assert outcome["protocol_valid"]
+    assert outcome["verifier_passed"]
+    assert outcome["observer_state"] == ["yes"]
+    assert private_artifacts["tool_outputs"] == ([] if treatment is None else [treatment])
+    assert "disclosure_tool_outputs" not in private_artifacts
+    if treatment is None:
+        return
+    raw_events = [
+        json.loads(line) for line in private_artifacts["runtime_streams"]["stdout"].splitlines()
+    ]
+    projected_events = [
+        json.loads(line)
+        for line in private_artifacts["runtime_streams"]["output_events"].splitlines()
+    ]
+    raw_read = next(event for event in raw_events if event["type"] == "tool_execution_end")
+    projected_read = next(
+        event for event in projected_events if event["type"] == "tool_execution_end"
+    )
+    assert raw_read["result"]["content"][0]["text"] == treatment
+    assert not scan_disclosure(raw=json.dumps(projected_read).encode(), treatment=treatment)
 
 
 @dataclass(frozen=True)
@@ -114,6 +169,7 @@ class ProductionOperationsTest(unittest.TestCase):
                     {"path": "out.txt", "sha256": "a" * 64},
                     {"path": "verify.py", "sha256": sha256(verifier).hexdigest()},
                 ],
+                "public_files": {},
             }
             witnesses = tuple(
                 ReachabilityWitness(
@@ -122,7 +178,16 @@ class ProductionOperationsTest(unittest.TestCase):
                     canonical_bytes(
                         {
                             "schema": "instruct-eval-witness-input-v1",
-                            "changes": [{"path": "out.txt", "content": result}],
+                            "actions": [
+                                {"tool": "write", "path": "out.txt", "content": result},
+                                {
+                                    "tool": "respond",
+                                    "response": {
+                                        "completion": "complete" if passed else "incomplete",
+                                        "summary": result,
+                                    },
+                                },
+                            ],
                         }
                     ),
                     passed,
@@ -160,6 +225,7 @@ class ProductionOperationsTest(unittest.TestCase):
                         "observer_path": "observe.py",
                         "verifier_command": ["python", "verify.py"],
                         "observer_command": ["python", "observe.py"],
+                        "observation_contract": OBSERVATION_CONTRACT,
                     },
                     classification,
                 )
@@ -333,6 +399,7 @@ class ProductionOperationsTest(unittest.TestCase):
                         {"path": path, "sha256": sha256(content).hexdigest()}
                         for path, content in sorted(files.items())
                     ],
+                    "public_files": {},
                 }
                 witnesses = tuple(
                     ReachabilityWitness(
@@ -341,7 +408,18 @@ class ProductionOperationsTest(unittest.TestCase):
                         canonical_bytes(
                             {
                                 "schema": "instruct-eval-witness-input-v1",
-                                "changes": [{"path": "out.txt", "content": result}],
+                                "actions": [
+                                    {"tool": "write", "path": "out.txt", "content": result},
+                                    {
+                                        "tool": "respond",
+                                        "response": {
+                                            "completion": (
+                                                "complete" if verifier_passed else "incomplete"
+                                            ),
+                                            "summary": result,
+                                        },
+                                    },
+                                ],
                             }
                         ),
                         verifier_passed,
@@ -384,6 +462,7 @@ class ProductionOperationsTest(unittest.TestCase):
                         "observer_path": "observe.py",
                         "verifier_command": [sys.executable, "verify.py"],
                         "observer_command": [sys.executable, "observe.py"],
+                        "observation_contract": OBSERVATION_CONTRACT,
                     },
                     context.classification,
                 )
@@ -423,10 +502,21 @@ class ProductionOperationsTest(unittest.TestCase):
                     "child",
                 )
 
-            g0_payload = {"gate": "G0", "eligibility": {"accepted": True}, "accepted": True}
+            g0_payload = {"gate": "G0", "eligibility": {"eligible": True}, "accepted": True}
             g0 = cast(
                 GatePublication,
                 operations.g0_commit(gate(g0_payload), artifacts, coordination, object()),
+            )
+            backend = build_public_production_backend(
+                PublicProductionConfig(
+                    "127.0.0.1:7233",
+                    Path(root) / "public",
+                    Path(root) / "coord.sqlite",
+                    {"role": "request"},
+                )
+            )
+            _, _, g0_record_hash = InstructEvalActivities(coordination, backend)._publish_ledger(
+                gate(g0_payload), "g0_commit", canonical_bytes(g0_payload), g0
             )
             package = json.loads(
                 canonical_bytes(
@@ -455,7 +545,7 @@ class ProductionOperationsTest(unittest.TestCase):
                 "2" * 32,
                 context.campaign,
                 context.claim_hash,
-                g0.artifact_sha256,
+                g0_record_hash,
                 context.treatment_hash,
                 manifest_hash,
                 package,
@@ -494,7 +584,7 @@ class ProductionOperationsTest(unittest.TestCase):
                     target_id=context.claim_hash,
                     action="submit_design",
                     proposal_hash=proposal.hash,
-                    expected_revision_hash=g0.artifact_sha256,
+                    expected_revision_hash=g0_record_hash,
                     sequence=1,
                 ).payload(),
             )
@@ -510,7 +600,7 @@ class ProductionOperationsTest(unittest.TestCase):
                     target_id=context.claim_hash,
                     action="submit_design",
                     proposal_hash=proposal.hash,
-                    expected_revision_hash=g0.artifact_sha256,
+                    expected_revision_hash=g0_record_hash,
                     sequence=1,
                 )
             )
@@ -523,7 +613,7 @@ class ProductionOperationsTest(unittest.TestCase):
                 "input": public_input,
                 "design_sha256": proposal.design_hash,
                 "proposal_sha256": proposal.hash,
-                "g0_record_sha256": g0.artifact_sha256,
+                "g0_record_sha256": g0_record_hash,
             }
             g1 = cast(
                 GatePublication,
@@ -535,31 +625,23 @@ class ProductionOperationsTest(unittest.TestCase):
                 ),
             )
             assert g1.payload["experiment_design_sha256"] == design.hash
-            packets: list[Mapping[str, object]] = []
             runtime = SimpleNamespace(
                 run_witness=run_witness,
-                invoke_role=lambda _contract, packet, _role_request: (
-                    packets.append(packet)
-                    or {
-                        "adversary_decision": {
-                            "accepted": True,
-                            "packet_sha256": packet["packet_sha256"],
-                        },
-                        "rejections": [],
-                        "stress_review": None,
-                    }
-                ),
+                invoke_role=lambda _contract, packet, _role_request: {
+                    "adversary_decision": {
+                        "accepted": True,
+                        "packet_sha256": packet["packet_sha256"],
+                    },
+                    "rejections": [],
+                    "stress_review": None,
+                },
             )
-            g2 = cast(
+            assert cast(
                 GatePublication,
                 operations.pre_run_validity(
                     gate({**base, "gate": "G2"}), artifacts, coordination, runtime
                 ),
-            )
-            assert g2.payload["accepted"]
-            assert g2.payload["adversary_decision"]["packet_sha256"] == canonical_hash(
-                {key: value for key, value in packets[0].items() if key != "packet_sha256"}
-            )
+            ).payload["accepted"]
             freeze = cast(
                 GatePublication,
                 operations.freeze(
@@ -569,7 +651,7 @@ class ProductionOperationsTest(unittest.TestCase):
                             "commit": "freeze",
                             "map_ref": "opaque-map",
                             "map_commitment": "opaque-commitment",
-                            "tokens": [f"token-{index}" for index in range(10)],
+                            "tokens": [f"token-{index}" for index in range(len(ASSIGNMENT_IDS))],
                             "pre_map_input_hash": "c" * 64,
                             "authorization_rule_sha256": "d" * 64,
                             "authorization_sha256": "e" * 64,
@@ -581,6 +663,41 @@ class ProductionOperationsTest(unittest.TestCase):
                 ),
             )
             assert freeze.payload["accepted"]
+            outcome_hashes = [
+                canonical_hash({"index": index}) for index in range(len(ASSIGNMENT_IDS))
+            ]
+            execution_payload = {
+                "input": public_input,
+                "gate": "G3",
+                "design_sha256": proposal.design_hash,
+                "outcome_sha256s": outcome_hashes,
+                "outcomes_sha256": canonical_hash({"outcome_sha256s": outcome_hashes}),
+                "trial_accounting": [
+                    {"token": token, "disposition": "result"} for token in freeze.payload["tokens"]
+                ],
+                "protocol_valid": True,
+                "verifier_passed": [True] * len(ASSIGNMENT_IDS),
+                "accepted": True,
+            }
+            assert cast(
+                GatePublication,
+                operations.execution_commit(
+                    gate(execution_payload), artifacts, coordination, object()
+                ),
+            ).payload["accepted"]
+            for private_field in ("private", "treatment"):
+                with pytest.raises(ProtocolError):
+                    operations.execution_commit(
+                        gate(
+                            {
+                                **execution_payload,
+                                "input": {**public_input, "nested": {private_field: "hidden"}},
+                            }
+                        ),
+                        artifacts,
+                        coordination,
+                        object(),
+                    )
             with pytest.raises(ProtocolError):
                 operations.design_commit(
                     gate({**base, "gate": "G1", "staged_design_sha256": "f" * 64}),
@@ -607,20 +724,82 @@ class ProductionOperationsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             operations = concrete_domain_operations({"role": "request"})
             artifacts = ArtifactStore(Path(root) / "public", Path(root) / "private")
-            scores = [{"blind_id": f"blind-{index}", "direction": "better"} for index in range(10)]
+            fixture_ids = ("core-1", "core-2", "negative-control")
+            fixtures = [
+                {
+                    "fixture_id": fixture_id,
+                    "axes": [{"name": "result", "values": ["yes", "no"]}],
+                    "directions": [
+                        {"code": "better", "description": "yes"},
+                        {"code": "worse", "description": "no"},
+                    ],
+                    "outcome_table": [
+                        {"outcome": [passed, value], "direction": direction}
+                        for passed in (False, True)
+                        for value, direction in (("yes", "better"), ("no", "worse"))
+                    ],
+                }
+                for fixture_id in fixture_ids
+            ]
+            artifacts.publish_json(
+                f"scoring/campaign/experiment/{'d' * 64}.json",
+                {"design_sha256": "d" * 64, "fixtures": fixtures},
+            )
+            outcomes = [
+                {
+                    "blind_id": f"blind-{index}",
+                    "fixture": fixture_ids[index % 3],
+                    "protocol_valid": True,
+                    "verifier_passed": index % 2 == 0,
+                    "observer_state": ["yes" if index % 2 == 0 else "no"],
+                    "direction_code": "must-not-reach-scorer",
+                    "changed_paths": ["out.txt"],
+                    "evidence_id": "opaque-evidence",
+                }
+                for index in range(len(ASSIGNMENT_IDS))
+            ]
+            scores = [
+                {"blind_id": f"blind-{index}", "direction": "better" if index % 2 == 0 else "worse"}
+                for index in range(len(ASSIGNMENT_IDS))
+            ]
+
+            def score(contract, packet, request):
+                assert set(packet) == {"fixtures", "outcomes"}
+                scored = []
+                for outcome in packet["outcomes"]:
+                    assert set(outcome) == {
+                        "blind_id",
+                        "fixture",
+                        "verifier_passed",
+                        "observer_state",
+                    }
+                    fixture = next(
+                        item
+                        for item in packet["fixtures"]
+                        if item["fixture_id"] == outcome["fixture"]
+                    )
+                    row = next(
+                        item
+                        for item in fixture["outcome_table"]
+                        if item["outcome"]
+                        == [outcome["verifier_passed"], *outcome["observer_state"]]
+                    )
+                    scored.append({"blind_id": outcome["blind_id"], "direction": row["direction"]})
+                return {"blind_scores": scored}
+
             result = cast(
                 Mapping[str, object],
                 operations.evidence_audit(
-                    self.request({"design_sha256": "d" * 64, "outcomes": [{} for _ in range(10)]}),
+                    self.request({"design_sha256": "d" * 64, "outcomes": outcomes}),
                     artifacts,
                     CoordinationStore(Path(root) / "coord.sqlite"),
-                    self.runtime({"blind_scores": scores}),
+                    SimpleNamespace(invoke_role=score),
                 ),
             )
             assert result == {"blind_scores": scores}
             with pytest.raises(ProtocolError):
                 operations.evidence_audit(
-                    self.request({"design_sha256": "d" * 64, "outcomes": [{} for _ in range(10)]}),
+                    self.request({"design_sha256": "d" * 64, "outcomes": outcomes}),
                     artifacts,
                     CoordinationStore(Path(root) / "coord.sqlite"),
                     self.runtime({"scores": {}}),
@@ -666,20 +845,8 @@ class ProductionOperationsTest(unittest.TestCase):
                     if condition == "B" and scenario != "negative-control"
                     else "same",
                 }
-                for index, (scenario, condition) in enumerate(
-                    [
-                        ("core-1", "A"),
-                        ("core-1", "A"),
-                        ("core-1", "B"),
-                        ("core-1", "B"),
-                        ("core-2", "A"),
-                        ("core-2", "A"),
-                        ("core-2", "B"),
-                        ("core-2", "B"),
-                        ("negative-control", "A"),
-                        ("negative-control", "B"),
-                    ]
-                )
+                for index, assignment_id in enumerate(ASSIGNMENT_IDS)
+                for scenario, condition, _ in [assignment_id.rsplit("-", 2)]
             ]
             unsigned = {
                 "assignments": assignments,
@@ -896,6 +1063,9 @@ class ProductionOperationsTest(unittest.TestCase):
             )
             assert not hasattr(backend._artifacts, "private_root")
 
+            assert not hasattr(public, "private_root")
+            public.publish_json("gates/G0.json", {"accepted": True})
+            assert json.loads(public.read_bytes("gates/G0.json")) == {"accepted": True}
             assert not hasattr(public, "private_root")
             with pytest.raises(ArtifactError):
                 public.read_bytes("secret.json", ArtifactMode.PRIVATE)
@@ -1158,44 +1328,256 @@ class ProductionOperationsTest(unittest.TestCase):
                     "1" * 64, (SourceCoverage(0, 1, "claim_normative", "claim-0001"),)
                 )
             )
-            frozen_design = ExperimentDesign.from_payload(
+            placeholder_design = ExperimentDesign.from_payload(
                 cast(Mapping[str, object], package["experiment_design"])
             )
+            fixture_root = Path(root) / "core-1"
+            fixture_root.mkdir()
+            verifier = (
+                b"import pathlib, sys\n"
+                b'sys.exit(0 if pathlib.Path("out.txt").read_text() == "yes" else 1)\n'
+            )
+            observer = (
+                b"import json, pathlib\n"
+                b'print(json.dumps({"result": pathlib.Path("out.txt").read_text()}))\n'
+            )
+            files = {
+                "TASK.txt": b"scenario",
+                "out.txt": b"base",
+                "observe.py": observer,
+                "verify.py": verifier,
+            }
+            for path, content in files.items():
+                (fixture_root / path).write_bytes(content)
+            manifest = {
+                "schema": "instruct-eval-fixture-manifest-v1",
+                "files": [
+                    {"path": path, "sha256": sha256(content).hexdigest()}
+                    for path, content in sorted(files.items())
+                ],
+                "public_files": {},
+            }
+            placeholder_fixture = next(
+                fixture for fixture in placeholder_design.fixtures if fixture.fixture_id == "core-1"
+            )
+            frozen_fixture = replace(
+                placeholder_fixture,
+                manifest=manifest,
+                manifest_sha256=canonical_hash(manifest),
+                verifier=Verifier(verifier, sha256(verifier).hexdigest()),
+                observe_source=observer,
+                observe_sha256=sha256(observer).hexdigest(),
+                witnesses=tuple(
+                    replace(
+                        witness,
+                        expected_unchanged_hashes=(
+                            ("observe.py", sha256(observer).hexdigest()),
+                            ("verify.py", sha256(verifier).hexdigest()),
+                        ),
+                    )
+                    for witness in placeholder_fixture.witnesses
+                ),
+                evidence_contract={
+                    "schema": "instruct-eval-evidence-contract-v1",
+                    "verifier_path": "verify.py",
+                    "observer_path": "observe.py",
+                    "verifier_command": [sys.executable, "verify.py"],
+                    "observer_command": [sys.executable, "observe.py"],
+                    "observation_contract": OBSERVATION_CONTRACT,
+                },
+            )
+            frozen_design = ExperimentDesign(
+                tuple(
+                    frozen_fixture if fixture.fixture_id == "core-1" else fixture
+                    for fixture in placeholder_design.fixtures
+                )
+            )
             executor = RuntimeSubjectExecutor(
-                {"core-1": Path(root)}, {"candidate_instruction": "original"}, b"k" * 32, {}
+                {"core-1": fixture_root},
+                {
+                    "candidate_instruction": "original",
+                    "permissions": {"tools": []},
+                },
+                b"k" * 32,
+                {"core-1": ("out.txt",)},
             )
-            outcome = SimpleNamespace(
-                protocol_valid=True,
-                verifier_passed=True,
-                observer_output={"result": "yes"},
-                changes="",
-                response="completed",
-                tool_outputs=(),
-                runtime_stdout="",
-                runtime_stderr="",
-                verifier_stdout="",
-                verifier_stderr="",
-                unchanged_hashes={},
-                reason=None,
-            )
-            with (
-                patch(
-                    "instruct_eval.production.role_runtime.run_subject", return_value=outcome
-                ) as run,
-                patch("instruct_eval.production.closed_outcome", return_value={"closed": True}),
+            executions = []
+            contexts = []
+            fault = None
+            expanded = "\ufdfa" * (MAX_NORMALIZED_SCALARS // len(normalize("\ufdfa")) + 1)
+            native_treatment = "treatment"
+
+            def execute_omp(execution):
+                (execution.workspace / "out.txt").write_text(
+                    "unknown" if fault == "frozen" else "yes", encoding="utf-8"
+                )
+                agents = execution.workspace / ".omp" / "AGENTS.md"
+                contexts.append(agents.read_text() if agents.is_file() else None)
+                if fault == "observer":
+                    (execution.workspace / "observe.py").write_text("changed", encoding="utf-8")
+                if fault == "paths":
+                    (execution.workspace / "extra.txt").write_text("unexpected", encoding="utf-8")
+                executions.append(execution)
+                input_path = str(agents.resolve())
+                native_read = {
+                    "content": [{"type": "text", "text": native_treatment}],
+                    "details": {
+                        "totalLines": 1,
+                        "displayContent": {
+                            "text": native_treatment,
+                            "startLine": 1,
+                            "lineNumbers": [1],
+                        },
+                        "fileSize": len(native_treatment.encode("utf-8")),
+                        "meta": {"source": {"type": "path", "value": input_path}},
+                    },
+                }
+                user = {
+                    "role": "user",
+                    "content": [{"type": "text", "text": execution.prompt}],
+                }
+                response = {"completion": "complete", "summary": "completed"}
+                assistant = {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(response, separators=(",", ":")),
+                        }
+                    ],
+                    "stopReason": "stop",
+                }
+                events = [
+                    {"type": "message_start", "message": user},
+                    {"type": "message_end", "message": user},
+                    {"type": "instruct_eval_observer_ready", "origin": "runtime_observer"},
+                    {"type": "message_end", "message": assistant},
+                    {
+                        "type": "agent_end",
+                        "stopReason": "stop",
+                        "messages": [user, assistant],
+                    },
+                ]
+                if agents.is_file():
+                    events[3:3] = [
+                        {
+                            "type": "tool_execution_start",
+                            "toolCallId": "context-read",
+                            "toolName": "read",
+                            "args": {"path": input_path},
+                        },
+                        {
+                            "type": "tool_execution_end",
+                            "toolCallId": "context-read",
+                            "toolName": "read",
+                            "isError": False,
+                            "result": native_read,
+                        },
+                    ]
+                if fault == "disclosure":
+                    events.insert(
+                        3,
+                        {
+                            "type": "tool_execution_update",
+                            "partialResult": {"content": [{"type": "text", "text": "treatment"}]},
+                        },
+                    )
+                return production.role_runtime._terminal_output(
+                    "".join(json.dumps(event) + "\n" for event in events),
+                    expanded if fault == "scan_limit" else "",
+                    prompt=execution.prompt,
+                    required=False,
+                    context=production.role_runtime._TerminalContext(
+                        input_file=(input_path, native_treatment) if agents.is_file() else None
+                    ),
+                )
+
+            with patch(
+                "instruct_eval.production.role_runtime.execute_omp",
+                side_effect=execute_omp,
             ):
-                for condition in ("A", "B"):
-                    assignment = PrivateAssignment("id", "core-1", condition, "blind", "x" * 64)
-                    result = executor(
-                        assignment=assignment,
+                results = [
+                    executor(
+                        assignment=PrivateAssignment(
+                            condition, "core-1", condition, "blind", "x" * 64
+                        ),
                         treatment="treatment",
                         disclosure_treatment="treatment",
                         frozen_design=frozen_design,
                     )
-                    assert result["outcome"] == {"closed": True}
-            assert [call.args[1] for call in run.call_args_list] == ["A", "B"]
-            assert all(
-                call.args[3]["candidate_instruction"] == "treatment" for call in run.call_args_list
+                    for condition in ("A", "B")
+                ]
+                invalid_results = []
+                for fault in ("observer", "disclosure", "frozen", "paths", "scan_limit"):
+                    invalid_results.append(
+                        executor(
+                            assignment=PrivateAssignment(fault, "core-1", "A", "blind", "x" * 64),
+                            treatment="treatment",
+                            disclosure_treatment="treatment",
+                            frozen_design=frozen_design,
+                        )
+                    )
+            for result, input_treatment in zip(results, (None, native_treatment), strict=True):
+                _assert_valid_subject_artifacts(result, input_treatment)
+            for result in invalid_results:
+                _assert_retained_invalid_subject(result)
+            control, treatment = executions[:2]
+            assert "candidate_instruction" not in control.request
+            assert control.prompt == treatment.prompt == "scenario"
+            assert treatment.request["candidate_instruction"] == "treatment"
+            assert contexts[:2] == [None, "treatment"]
+
+    def test_decomposer_packet_hash_is_host_bound_and_response_is_verified(self) -> None:
+        instruction = "café"
+        source_sha256 = sha256(instruction.encode("utf-8")).hexdigest()
+        classification = {
+            "source_sha256": source_sha256,
+            "coverage": [
+                {
+                    "start_byte": 0,
+                    "end_byte": len(instruction.encode("utf-8")),
+                    "classification": "claim_normative",
+                    "owner": "p1",
+                }
+            ],
+        }
+        captured: dict[str, Mapping[str, object]] = {}
+
+        def invoke(contract, payload, request):
+            captured["payload"] = payload
+            return {
+                "provisional_groups": [{"group_id": "p1"}],
+                "source_classification": classification,
+            }
+
+        result = production._role_output(
+            "decomposition",
+            {"instruction": instruction},
+            SimpleNamespace(invoke_role=invoke),
+            {},
+        )
+        assert result["source_classification"] == classification
+        assert captured["payload"] == {
+            "instruction": instruction,
+            "source_sha256": source_sha256,
+            "source_byte_length": len(instruction.encode("utf-8")),
+        }
+        classification["source_sha256"] = "0" * 64
+        with pytest.raises(ProtocolError, match="source hash"):
+            production._role_output(
+                "decomposition",
+                {"instruction": instruction},
+                SimpleNamespace(invoke_role=invoke),
+                {},
+            )
+        classification["source_sha256"] = source_sha256
+        classification["coverage"][0]["end_byte"] = len(instruction)
+        with pytest.raises(ProtocolError):
+            production._role_output(
+                "decomposition",
+                {"instruction": instruction},
+                SimpleNamespace(invoke_role=invoke),
+                {},
             )
 
 

@@ -48,6 +48,8 @@ with workflow.unsafe.imports_passed_through():
     )
 from .messages import request_fingerprint
 from .models import canonical_bytes, canonical_hash
+from .trials import ASSIGNMENT_IDS
+from .trials import authorization_rule as canonical_authorization_rule
 
 _GATE_NAMES = ("G0", "G1", "G2", "G3", "G4", "G5", "G6")
 _CAMPAIGN_ID = re.compile(r"campaign-[0-9]{32}\Z")
@@ -282,8 +284,8 @@ def _deidentified_outcomes(trials: list[ActivityResult]) -> list[Mapping[str, An
         "evidence_id",
     }
     outcomes = [result.payload for result in trials]
-    if len(outcomes) != 10 or any(set(outcome) != fields for outcome in outcomes):
-        raise WorkflowProtocolError("G4 requires exactly ten closed deidentified outcomes")
+    if len(outcomes) != len(ASSIGNMENT_IDS) or any(set(outcome) != fields for outcome in outcomes):
+        raise WorkflowProtocolError("G4 requires every closed deidentified outcome")
     blind_ids = [outcome["blind_id"] for outcome in outcomes]
     if (
         any(not isinstance(blind_id, str) or not blind_id for blind_id in blind_ids)
@@ -291,15 +293,15 @@ def _deidentified_outcomes(trials: list[ActivityResult]) -> list[Mapping[str, An
             not isinstance(outcome["direction_code"], str) or not outcome["direction_code"]
             for outcome in outcomes
         )
-        or len(set(blind_ids)) != 10
+        or len(set(blind_ids)) != len(ASSIGNMENT_IDS)
     ):
-        raise WorkflowProtocolError("G4 outcomes must cover ten unique blind ids and directions")
+        raise WorkflowProtocolError("G4 outcomes must cover every unique blind id and direction")
     return outcomes
 
 
 def _blind_scores(value: Any, blind_ids: set[str]) -> list[Mapping[str, Any]]:
-    if not isinstance(value, list) or len(value) != 10:
-        raise WorkflowProtocolError("scorer must return exactly ten blind scores")
+    if not isinstance(value, list) or len(value) != len(ASSIGNMENT_IDS):
+        raise WorkflowProtocolError("scorer must return every blind score")
     fields = {"blind_id", "direction"}
     if any(not isinstance(score, Mapping) or set(score) != fields for score in value):
         raise WorkflowProtocolError("scorer blind-score fields are invalid")
@@ -316,8 +318,8 @@ def _g5_release(value: Any, blind_ids: set[str]) -> Mapping[str, Any]:
     if not isinstance(value, Mapping) or set(value) != fields:
         raise WorkflowProtocolError("G5 release packet is not exact")
     assignments = value["assignments"]
-    if not isinstance(assignments, list) or len(assignments) != 10:
-        raise WorkflowProtocolError("G5 release must contain ten joined records")
+    if not isinstance(assignments, list) or len(assignments) != len(ASSIGNMENT_IDS):
+        raise WorkflowProtocolError("G5 release must contain every joined record")
     row_fields = {"blind_id", "scenario", "condition", "direction"}
     if any(not isinstance(row, Mapping) or set(row) != row_fields for row in assignments):
         raise WorkflowProtocolError("G5 released record fields are invalid")
@@ -337,14 +339,8 @@ def _g5_release(value: Any, blind_ids: set[str]) -> Mapping[str, Any]:
         or any(not isinstance(direction, str) or not direction for direction in preferred.values())
     ):
         raise WorkflowProtocolError("G5 preferred directions are invalid")
-    authorization_rule = value["authorization_rule"]
-    if authorization_rule != {
-        "schema": "instruct-eval-authorization-rule-v1",
-        "core_scenarios": ["core-1", "core-2"],
-        "negative_control_scenario": "negative-control",
-        "core_comparison": "preferred_count_B_strictly_greater_than_A",
-        "negative_control_comparison": "both_subjects_match_preferred_direction",
-    }:
+    release_rule = value["authorization_rule"]
+    if release_rule != canonical_authorization_rule():
         raise WorkflowProtocolError("G5 authorization rule is invalid")
     release_sha256 = value["release_sha256"]
     if not isinstance(release_sha256, str):
@@ -800,7 +796,7 @@ class InstructionExperimentWorkflow:
         )
         if not isinstance(eligibility, ActivityResult):
             raise WorkflowProtocolError("eligibility result is malformed")
-        eligibility_accepted = eligibility.payload.get("accepted") is True
+        eligibility_accepted = eligibility.payload.get("eligible") is True
         g0 = await self._execute_gate(
             "instruct_eval.g0_commit",
             GateRequest,
@@ -883,11 +879,11 @@ class InstructionExperimentWorkflow:
             not isinstance(map_ref, str)
             or not isinstance(map_commitment, str)
             or not isinstance(tokens, (list, tuple))
-            or len(tokens) != 10
-            or len(set(tokens)) != 10
+            or len(tokens) != len(ASSIGNMENT_IDS)
+            or len(set(tokens)) != len(ASSIGNMENT_IDS)
         ):
             raise WorkflowProtocolError(
-                "freeze requires one map reference, commitment, and ten unique opaque tokens"
+                "freeze requires one map reference, commitment, and every unique opaque token"
             )
         for value in (
             prepared.payload["pre_map_input_hash"],
@@ -958,7 +954,7 @@ class InstructionExperimentWorkflow:
             not state.terminal
             and not state.cancelled
             and len(state.outstanding) < 4
-            and state.next_token < 10
+            and state.next_token < len(ASSIGNMENT_IDS)
         ):
             token = self._trial_tokens[state.next_token]
             state.next_token += 1
@@ -1068,19 +1064,23 @@ class InstructionExperimentWorkflow:
             if state.accounting[token] == "result"
         ]
         outcome_sha256s = tuple(result.result_sha256 for result in accepted_trials)
-        exact_ten_accepted = (
-            len(accepted_trials) == 10
-            and len(set(outcome_sha256s)) == 10
+        all_trials_accepted = (
+            len(accepted_trials) == len(ASSIGNMENT_IDS)
+            and len(set(outcome_sha256s)) == len(ASSIGNMENT_IDS)
             and all(result.payload.get("protocol_valid") is True for result in accepted_trials)
         )
-        return trial_accounting, accepted_trials, exact_ten_accepted
+        return trial_accounting, accepted_trials, all_trials_accepted
 
     async def _commit_g3(
         self, input_: ExperimentInput, map_ref: str, design_sha256: str
     ) -> _G3Outcomes | ExperimentResult:
         state = await self._collect_trials(map_ref, design_sha256)
-        trial_accounting, accepted_trials, exact_ten_accepted = self._g3_trial_data(state)
-        outcomes = _deidentified_outcomes(accepted_trials) if len(accepted_trials) == 10 else []
+        trial_accounting, accepted_trials, all_trials_accepted = self._g3_trial_data(state)
+        outcomes = (
+            _deidentified_outcomes(accepted_trials)
+            if len(accepted_trials) == len(ASSIGNMENT_IDS)
+            else []
+        )
         outcome_sha256s = tuple(result.result_sha256 for result in accepted_trials)
         verifier_passed = tuple(result.payload.get("verifier_passed") for result in accepted_trials)
         execution = await self._execute_gate(
@@ -1094,16 +1094,16 @@ class InstructionExperimentWorkflow:
                     "outcome_sha256s": outcome_sha256s,
                     "outcomes_sha256": canonical_hash({"outcome_sha256s": outcome_sha256s}),
                     "trial_accounting": trial_accounting,
-                    "protocol_valid": exact_ten_accepted,
+                    "protocol_valid": all_trials_accepted,
                     "verifier_passed": verifier_passed,
-                    "accepted": exact_ten_accepted,
+                    "accepted": all_trials_accepted,
                 },
             ),
         )
         if state.cancelled:
             self._advance_gate(ExperimentGate.G3, execution)
             return await self._terminal_result(ExperimentGate.CANCELED, "operator_cancelled")
-        if not exact_ten_accepted or execution.payload.get("accepted") is not True:
+        if not all_trials_accepted or execution.payload.get("accepted") is not True:
             self._advance_gate(ExperimentGate.G3, execution)
             return await self._terminal_result(
                 ExperimentGate.PROTOCOL_FAILURE, "G3 protocol failure"

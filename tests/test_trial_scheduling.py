@@ -15,6 +15,7 @@ from instruct_eval.models import canonical_bytes
 from instruct_eval.trials import (
     ASSIGNMENT_IDS,
     MAX_CHANNEL_BYTES,
+    MAX_NORMALIZED_SCALARS,
     SUBJECT_ARTIFACT_KINDS,
     AhoMatcher,
     ClosedOutcomeParams,
@@ -28,6 +29,7 @@ from instruct_eval.trials import (
     closed_outcome,
     condition_disclosure,
     g6_authorized,
+    normalize,
     prepare_private_map,
     private_artifact_commitment,
     private_artifact_descriptor,
@@ -195,7 +197,7 @@ class TrialSchedulingTests(unittest.TestCase):
                             seed=b"x" * 32,
                         )
                     )
-                    for index in range(10):
+                    for index in range(len(ASSIGNMENT_IDS)):
                         assignment = lifecycle.resolve_index(metadata=self.metadata, index=index)
                         outcome = {
                             "blind_id": assignment.blind_id,
@@ -239,7 +241,7 @@ class TrialSchedulingTests(unittest.TestCase):
             "canceled-before-invocation",
             "UNSCHEDULED_DUE_TO_TERMINAL",
         }
-        assert len(accounting) == 10
+        assert len(accounting) == len(ASSIGNMENT_IDS)
         dispatcher = TrialDispatcher(self.mapping)
         started = dispatcher.dispatch()
         dispatcher.cancel()
@@ -253,6 +255,14 @@ class TrialSchedulingTests(unittest.TestCase):
         assert condition_disclosure("condition\u3000=\xa0A")
         assert not condition_disclosure("condition\x1c=A")
         assert scan_disclosure(raw=(b"Condition", b" = A"), treatment="other")
+        channel = b"z" * (MAX_CHANNEL_BYTES // 32)
+        channels = (channel,) * 16
+        assert not scan_disclosure(raw=channels, treatment="other")
+        assert not scan_disclosure(raw=b"".join(channels), treatment="other")
+        assert scan_disclosure(raw=(b"e", "\u0301".encode()), treatment="é")
+        expanded = "\ufdfa" * (MAX_NORMALIZED_SCALARS // len(normalize("\ufdfa")) + 1)
+        with pytest.raises(TrialProtocolError):
+            scan_disclosure(raw=expanded.encode(), treatment="other")
         with pytest.raises(TrialProtocolError):
             scan_disclosure(raw=b"x" * (MAX_CHANNEL_BYTES + 1), treatment="x")
         with pytest.raises(TrialProtocolError):
@@ -356,7 +366,7 @@ class TrialSchedulingTests(unittest.TestCase):
             "release_sha256",
         }
         assert release["assignments"] == sorted(scores, key=lambda score: score["blind_id"])
-        assert len(release["assignments"]) == 10
+        assert len(release["assignments"]) == len(ASSIGNMENT_IDS)
         assert (
             release["release_sha256"]
             == sha256(
@@ -380,6 +390,16 @@ class TrialSchedulingTests(unittest.TestCase):
             with pytest.raises(TrialProtocolError):
                 release_g5(self.mapping, items, key, broken_directions)
         assert g6_authorized(scores, self.preferred)
+        negative_control = next(
+            score for score in scores if score["scenario"] == "negative-control"
+        )
+        assert not g6_authorized(
+            [
+                {**score, "direction": "wrong"} if score is negative_control else score
+                for score in scores
+            ],
+            self.preferred,
+        )
         assert not g6_authorized(scores[:-1], self.preferred)
         assert not g6_authorized([*scores, {**scores[0], "blind_id": "extra"}], self.preferred)
         assert not g6_authorized([{**scores[0], "extra": "field"}, *scores[1:]], self.preferred)

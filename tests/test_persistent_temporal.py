@@ -22,14 +22,30 @@ from uuid import uuid4
 import pytest
 import test_temporal_integration as baseline
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from temporalio import activity
 from temporalio.client import Client, WorkflowUpdateFailedError
 from temporalio.service import RPCError
 from temporalio.worker import Replayer, Worker
 
 from instruct_eval import cli, worker
-from instruct_eval.activities import GatePublication, InstructEvalActivities
-from instruct_eval.coordination import CoordinationError, CoordinationStore, InvocationDisposition
-from instruct_eval.messages import ProposalControl, request_fingerprint
+from instruct_eval.activities import (
+    GatePublication,
+    GateResult,
+    InstructEvalActivities,
+    ReleaseRequest,
+)
+from instruct_eval.coordination import (
+    CoordinationError,
+    CoordinationStore,
+    GatePublicationRequest,
+    InvocationDisposition,
+)
+from instruct_eval.messages import (
+    ProposalControl,
+    StageDecompositionRequest,
+    StageDesignRequest,
+    request_fingerprint,
+)
 from instruct_eval.models import (
     Direction,
     EvidenceAxis,
@@ -56,8 +72,10 @@ from instruct_eval.signing import (
     DecompositionProposal,
     DesignProposal,
     StageAttestation,
+    StageAttestationSigningParameters,
     public_key_base64url,
 )
+from instruct_eval.trials import ASSIGNMENT_IDS
 from instruct_eval.workflows import (
     CampaignInput,
     ExperimentCampaignWorkflow,
@@ -243,28 +261,9 @@ class _PostCommitInterruptStore(CoordinationStore):
         return committed
 
     @override
-    def publish_gate(
-        self,
-        workflow_id: str,
-        run_id: str,
-        ordinal: int,
-        expected_revision_sha256: str,
-        owner_epoch: int,
-        final_artifact_path: str | Path,
-        expected_bytes: bytes,
-        expected_sha256: str,
-    ):
-        publication = super().publish_gate(
-            workflow_id,
-            run_id,
-            ordinal,
-            expected_revision_sha256,
-            owner_epoch,
-            final_artifact_path,
-            expected_bytes,
-            expected_sha256,
-        )
-        if self.interrupt_release_publish and Path(final_artifact_path).name.endswith(
+    def publish_gate(self, request: GatePublicationRequest):
+        publication = super().publish_gate(request)
+        if self.interrupt_release_publish and Path(request.final_artifact_path).name.endswith(
             "-release.json"
         ):
             self.interrupt_release_publish = False
@@ -297,12 +296,10 @@ class _TwoClaimBackend(baseline._ControlledBackend):
         self._private_authority = ArtifactPrivateAuthority(self.artifacts)
         self.authorize_g6 = options.authorize_g6
         self.release_started = asyncio.Event()
-        self.release_permit = asyncio.Event()
+        self.release_permit = asyncio.Semaphore(0 if options.hold_release else len(options.claims))
         self.subject_permit = asyncio.Event()
         if not options.interrupt_after_subject_commit:
             self.subject_permit.set()
-        if not options.hold_release:
-            self.release_permit.set()
 
     def _operation(self, name: str):
         parent = super()._operation(name)
@@ -415,8 +412,6 @@ class _TwoClaimBackend(baseline._ControlledBackend):
 
     async def release(self, request: Any) -> Any:
         self.release_calls += 1
-        self.release_started.set()
-        await self.release_permit.wait()
         with closing(sqlite3.connect(self._private_maps.path)) as database:
             map_ref = database.execute(
                 "SELECT map_ref FROM private_maps WHERE experiment = ?", (request.experiment_id,)
@@ -424,7 +419,7 @@ class _TwoClaimBackend(baseline._ControlledBackend):
             inventory_count = database.execute(
                 "SELECT COUNT(*) FROM private_artifacts WHERE map_ref = ?", (map_ref,)
             ).fetchone()[0]
-        expected_inventory = 1 + 10 * len(worker.SUBJECT_ARTIFACT_KINDS)
+        expected_inventory = 1 + len(ASSIGNMENT_IDS) * len(worker.SUBJECT_ARTIFACT_KINDS)
         if inventory_count != expected_inventory:
             raise AssertionError(
                 "release requires one map and the exact token-bound artifact inventory; "
@@ -514,6 +509,13 @@ class PersistentTemporalTests(unittest.IsolatedAsyncioTestCase):
     def _workers(self, backend: _TwoClaimBackend) -> tuple[Worker, Worker]:
         backend.bind_client(self.client)
         activities = InstructEvalActivities(backend.coordination, backend)
+
+        @activity.defn(name="instruct_eval.release")
+        async def controlled_release(request: ReleaseRequest) -> GateResult:
+            backend.release_started.set()
+            await backend.release_permit.acquire()
+            return await activities.release(request)
+
         public = Worker(
             self.client,
             task_queue=f"instruct-eval-public-{self.suffix}",
@@ -525,7 +527,10 @@ class PersistentTemporalTests(unittest.IsolatedAsyncioTestCase):
         private = Worker(
             self.client,
             task_queue="instruct-eval-private",
-            activities=[getattr(activities, name) for name in worker.PRIVATE_ACTIVITY_METHODS],
+            activities=[
+                controlled_release if name == "release" else getattr(activities, name)
+                for name in worker.PRIVATE_ACTIVITY_METHODS
+            ],
         )
         return public, private
 
@@ -583,11 +588,13 @@ class PersistentTemporalTests(unittest.IsolatedAsyncioTestCase):
             claims,
         )
         ProposalControl(backend.artifacts, backend.coordination).stage_decomposition(
-            private_key=self.private_key,
-            owner_public_key=public_key_base64url(self.private_key.public_key()),
-            campaign_id=self.campaign_id,
-            fingerprint=proposal.request_fingerprint,
-            proposal=proposal,
+            StageDecompositionRequest(
+                private_key=self.private_key,
+                owner_public_key=public_key_base64url(self.private_key.public_key()),
+                campaign_id=self.campaign_id,
+                fingerprint=proposal.request_fingerprint,
+                proposal=proposal,
+            )
         )
         backend.treatment_texts = treatment_texts
         backend.treatment_hashes = treatment_hashes
@@ -730,24 +737,28 @@ class PersistentTemporalTests(unittest.IsolatedAsyncioTestCase):
         )
         attestation = StageAttestation.sign(
             self.private_key,
-            campaign_id=self.campaign_id,
-            claim_hash=claim,
-            proposal_nonce=proposal.proposal_nonce,
-            proposal_hash=proposal.hash,
-            g0_commit_hash=proposal.g0_commit_hash,
-            treatment_hash=proposal.treatment_hash,
-            fixture_manifest_hash=proposal.fixture_manifest_hash,
+            StageAttestationSigningParameters(
+                campaign_id=self.campaign_id,
+                claim_hash=claim,
+                proposal_nonce=proposal.proposal_nonce,
+                proposal_hash=proposal.hash,
+                g0_commit_hash=proposal.g0_commit_hash,
+                treatment_hash=proposal.treatment_hash,
+                fixture_manifest_hash=proposal.fixture_manifest_hash,
+            ),
         )
         staged = ProposalControl(backend.artifacts, backend.coordination).stage_design(
-            private_key=self.private_key,
-            owner_public_key=public_key_base64url(self.private_key.public_key()),
-            campaign_id=self.campaign_id,
-            claim_hash=claim,
-            g0_commit_hash=g0_commit_hash,
-            treatment_hash=proposal.treatment_hash,
-            fixture_manifest_hash=proposal.fixture_manifest_hash,
-            proposal=proposal,
-            attestation=attestation,
+            StageDesignRequest(
+                private_key=self.private_key,
+                owner_public_key=public_key_base64url(self.private_key.public_key()),
+                campaign_id=self.campaign_id,
+                claim_hash=claim,
+                g0_commit_hash=g0_commit_hash,
+                treatment_hash=proposal.treatment_hash,
+                fixture_manifest_hash=proposal.fixture_manifest_hash,
+                proposal=proposal,
+                attestation=attestation,
+            )
         )
         assert staged.proposal_hash == proposal.hash
         return proposal.hash
@@ -947,7 +958,7 @@ class PersistentTemporalTests(unittest.IsolatedAsyncioTestCase):
             backend.coordination.on_interruption = lambda: self._interrupt_private_worker(private)
             await asyncio.wait_for(backend.release_started.wait(), timeout=30)
             await self._assert_pre_release_privacy(interrupted)
-            backend.release_permit.set()
+            backend.release_permit.release()
             for _ in range(200):
                 if not backend.coordination.interrupt_release_publish:
                     break
@@ -992,11 +1003,12 @@ class PersistentTemporalTests(unittest.IsolatedAsyncioTestCase):
             str(item["experiment_id"]): str(item["claim_sha256"])
             for item in interrupted.first_backend.issued
         }
+        condition_counts = Counter(assignment.rsplit("-", 2)[1] for assignment in ASSIGNMENT_IDS)
         assert Counter(
             (experiment_id, condition) for experiment_id, condition, _ in all_treatments
         ) == Counter(
             {
-                (experiment_id, condition): 5
+                (experiment_id, condition): condition_counts[condition]
                 for experiment_id in claim_by_experiment
                 for condition in ("A", "B")
             }
@@ -1035,7 +1047,7 @@ class PersistentTemporalTests(unittest.IsolatedAsyncioTestCase):
         combined_executor_calls.update(release_interrupted.release_backend.subject_executor_calls)
         combined_executor_calls.update(backend.subject_executor_calls)
         assert set(combined_executor_calls.values()) == {1}
-        assert len(combined_executor_calls) == 20
+        assert len(combined_executor_calls) == 2 * len(ASSIGNMENT_IDS)
         all_requests = (
             interrupted.first_backend.subject_requests
             + release_interrupted.release_backend.subject_requests
@@ -1051,7 +1063,7 @@ class PersistentTemporalTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT invocation_key, state, input_bytes, result_bytes FROM invocations"
             ).fetchall()
         subject_rows = [row for row in rows if json.loads(row[2])["purpose"] == "subject_trial"]
-        assert len(subject_rows) == 20
+        assert len(subject_rows) == 2 * len(ASSIGNMENT_IDS)
         assert {row[1] for row in subject_rows} == {"RESULT_COMMITTED"}
         by_child: dict[str, list[str]] = {}
         for _, _, request_bytes, _ in subject_rows:
@@ -1063,7 +1075,10 @@ class PersistentTemporalTests(unittest.IsolatedAsyncioTestCase):
         assert set(by_child) == {
             str(item["experiment_id"]) for item in interrupted.first_backend.issued
         }
-        assert all(len(tokens) == 10 and len(set(tokens)) == 10 for tokens in by_child.values())
+        assert all(
+            len(tokens) == len(ASSIGNMENT_IDS) and len(set(tokens)) == len(ASSIGNMENT_IDS)
+            for tokens in by_child.values()
+        )
 
     def _assert_gate_ledger(self) -> list[tuple[tuple[Any, ...], Mapping[str, Any]]]:
         with closing(sqlite3.connect(self.root / "coordination.sqlite")) as database:
@@ -1129,19 +1144,16 @@ class PersistentTemporalTests(unittest.IsolatedAsyncioTestCase):
             assert raw == canonical_bytes(release)
             unsigned = {key: value for key, value in release.items() if key != "release_sha256"}
             assert release["release_sha256"] == sha256(canonical_bytes(unsigned)).hexdigest()
-            assert len(release["assignments"]) == 10
-            assert len({item["blind_id"] for item in release["assignments"]}) == 10
+            assert len(release["assignments"]) == len(ASSIGNMENT_IDS)
+            assert len({item["blind_id"] for item in release["assignments"]}) == len(ASSIGNMENT_IDS)
             assert Counter(
                 (item["scenario"], item["condition"]) for item in release["assignments"]
             ) == Counter(
-                {
-                    ("core-1", "A"): 2,
-                    ("core-1", "B"): 2,
-                    ("core-2", "A"): 2,
-                    ("core-2", "B"): 2,
-                    ("negative-control", "A"): 1,
-                    ("negative-control", "B"): 1,
-                }
+                (
+                    assignment.rsplit("-", 2)[0],
+                    assignment.rsplit("-", 2)[1],
+                )
+                for assignment in ASSIGNMENT_IDS
             )
             assert g6_authorized(release["assignments"], release["preferred_directions"])
         return release_files[0]
@@ -1179,14 +1191,16 @@ class PersistentTemporalTests(unittest.IsolatedAsyncioTestCase):
         competing_path.write_bytes(competing_bytes)
         with pytest.raises(CoordinationError):
             backend.coordination.publish_gate(
-                release_gate[0],
-                release_gate[1],
-                release_gate[2],
-                release_gate[3],
-                release_gate[4],
-                competing_path,
-                competing_bytes,
-                sha256(competing_bytes).hexdigest(),
+                GatePublicationRequest(
+                    release_gate[0],
+                    release_gate[1],
+                    release_gate[2],
+                    release_gate[3],
+                    release_gate[4],
+                    competing_path,
+                    competing_bytes,
+                    sha256(competing_bytes).hexdigest(),
+                )
             )
         assert authoritative_release.read_bytes() == authoritative_bytes
 
@@ -1247,7 +1261,7 @@ class PersistentTemporalTests(unittest.IsolatedAsyncioTestCase):
         private_values = set(private_paths)
         for _, payload, *keys in private_rows:
             mapping = json.loads(payload)
-            assert len(mapping["assignment_order"]) == 10
+            assert len(mapping["assignment_order"]) == len(ASSIGNMENT_IDS)
             for value in [payload, *keys]:
                 raw = bytes(value)
                 private_values.update({base64.b64encode(raw).decode(), raw.hex()})

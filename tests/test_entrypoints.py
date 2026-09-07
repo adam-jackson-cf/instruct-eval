@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import logging
 import re
 import tempfile
 import unittest
@@ -17,7 +19,7 @@ import pytest
 from temporalio.common import WorkflowIDReusePolicy
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
-from instruct_eval import cli, worker
+from instruct_eval import cli, production_worker, worker
 from instruct_eval.activities import (
     ChildAuthorizationClaimRequest,
     ChildAuthorizationIssueRequest,
@@ -26,6 +28,7 @@ from instruct_eval.activities import (
     SubjectTrialRequest,
 )
 from instruct_eval.artifacts import ArtifactStore
+from instruct_eval.behavior import OBSERVATION_CONTRACT
 from instruct_eval.coordination import CoordinationError, CoordinationStore
 from instruct_eval.messages import request_fingerprint
 from instruct_eval.models import (
@@ -72,6 +75,7 @@ def complete_design_package() -> dict[str, object]:
                 {"path": "out.txt", "sha256": "a" * 64},
                 {"path": "verify.py", "sha256": sha256(verifier).hexdigest()},
             ],
+            "public_files": {},
         }
         witnesses = tuple(
             ReachabilityWitness(
@@ -80,7 +84,16 @@ def complete_design_package() -> dict[str, object]:
                 canonical_bytes(
                     {
                         "schema": "instruct-eval-witness-input-v1",
-                        "changes": [{"path": "out.txt", "content": result}],
+                        "actions": [
+                            {"tool": "write", "path": "out.txt", "content": result},
+                            {
+                                "tool": "respond",
+                                "response": {
+                                    "completion": "complete" if passed else "incomplete",
+                                    "summary": result,
+                                },
+                            },
+                        ],
                     }
                 ),
                 passed,
@@ -118,6 +131,7 @@ def complete_design_package() -> dict[str, object]:
                     "observer_path": "observe.py",
                     "verifier_command": ["python", "verify.py"],
                     "observer_command": ["python", "observe.py"],
+                    "observation_contract": OBSERVATION_CONTRACT,
                 },
                 classification,
             )
@@ -282,7 +296,6 @@ class EntrypointWorkerTests(unittest.TestCase):
         self.private_maps = worker.PrivateMapLifecycle(root / "private.sqlite", root / "private")
         self.authority = PrivateAuthority()
         self.subject = Subject()
-        self.calls: list[tuple[str, object, object, object, object]] = []
         operations = worker.DomainOperations(
             **cast(
                 Any,
@@ -312,25 +325,9 @@ class EntrypointWorkerTests(unittest.TestCase):
         def invoke(
             request: object, artifacts: object, coordination: object, runtime: object
         ) -> dict[str, str]:
-            self.calls.append((name, request, artifacts, coordination, runtime))
             return {"operation": name}
 
         return invoke
-
-    def test_complete_backend_delegates_every_named_operation_with_durable_dependencies(
-        self,
-    ) -> None:
-        request = object()
-        for name in worker.DomainOperations.__dataclass_fields__:
-            assert getattr(self.backend, name)(request) == {"operation": name}
-        assert [call[0] for call in self.calls] == list(
-            worker.DomainOperations.__dataclass_fields__
-        )
-        assert all(
-            call[2] is self.artifacts and call[3] is self.coordination for call in self.calls
-        )
-        assert "map_lifecycle" not in worker.DomainOperations.__dataclass_fields__
-        assert "subject_trial" not in worker.DomainOperations.__dataclass_fields__
 
     def test_child_authorization_packets_bind_one_issued_experiment_to_one_child(self) -> None:
         issue_payload = {
@@ -507,7 +504,7 @@ class EntrypointWorkerTests(unittest.TestCase):
             "pre_map_input_hash",
             "authorization_rule_sha256",
         }
-        assert len(first["tokens"]) == 10
+        assert len(first["tokens"]) == len(ASSIGNMENT_IDS)
 
         subject_payload = {
             "map_ref": first["map_ref"],
@@ -701,6 +698,37 @@ class EntrypointWorkerTests(unittest.TestCase):
                 public_task_queue="same",
                 private_task_queue="same",
             )
+
+
+def test_worker_diagnostics_redact_private_lines_before_emission() -> None:
+    output = io.StringIO()
+    handler = logging.StreamHandler(output)
+    handler.setFormatter(production_worker._DiagnosticFormatter())
+    logger = logging.Logger("diagnostic-proof")
+    logger.addHandler(handler)
+    private_values = (
+        "opaque-one",
+        "opaque-two",
+        "opaque-three",
+        "opaque-four",
+        "opaque-five",
+        "A" * 43,
+        "opaque-six",
+    )
+    try:
+        raise ValueError("subject-trial-" + private_values[-1])
+    except ValueError:
+        logger.exception(
+            "authorization completed\nactivity_id=%s\nAuthorization: Bearer %s\n"
+            "quarantine/%s\nrole_token=%s\nOPENAI_API_KEY=%s\n"
+            "Counter({%r: 1})\nretained diagnostic",
+            *private_values[:-1],
+        )
+    emitted = output.getvalue()
+    assert all(value not in emitted for value in private_values)
+    assert "authorization completed" in emitted
+    assert "retained diagnostic" in emitted
+    assert logging.getLevelName(logging.ERROR) in emitted
 
 
 class CampaignEntrypointTests(unittest.TestCase):

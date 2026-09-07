@@ -50,7 +50,7 @@ from instruct_eval.coordination import (
     InvocationDisposition,
 )
 from instruct_eval.models import ProtocolError, canonical_bytes
-from instruct_eval.trials import authorization_rule
+from instruct_eval.trials import ASSIGNMENT_IDS, authorization_rule
 
 
 def request(cls, payload=None, **gate):
@@ -79,15 +79,11 @@ def release_payload() -> dict[str, Any]:
                 "condition": condition,
                 "direction": preferred[scenario],
             }
-            for scenario, condition, count in (
-                ("core-1", "A", 2),
-                ("core-1", "B", 2),
-                ("core-2", "A", 2),
-                ("core-2", "B", 2),
-                ("negative-control", "A", 1),
-                ("negative-control", "B", 1),
-            )
-            for index in range(count)
+            for assignment in ASSIGNMENT_IDS
+            for scenario, condition in [
+                (assignment.rsplit("-", 2)[0], assignment.rsplit("-", 2)[1])
+            ]
+            for index in [assignment.rsplit("-", 1)[1]]
         ],
         key=lambda record: record["blind_id"],
     )
@@ -253,7 +249,7 @@ class ActivityTests(unittest.TestCase):
         payload = release_payload()
         data = canonical_bytes(payload)
         ReleasePublication(payload, self.root / "release.json", data, sha256(data).hexdigest())
-        with pytest.raises(ValueError, match="exactly ten assignments"):
+        with pytest.raises(ValueError, match="every canonical assignment"):
             ReleasePublication(
                 {**payload, "assignments": payload["assignments"][:-1]},
                 self.root / "release.json",
@@ -778,30 +774,45 @@ class ActivityTests(unittest.TestCase):
         assert self.backend.calls == []
 
     def test_semantic_gate_failure_commits_recoverable_protocol_disposition(self) -> None:
-        value = request(
-            ReleaseRequest,
-            workflow_id="workflow",
-            run_id="run",
-            ordinal=0,
-            prior_record_sha256="0" * 64,
-            expected_revision_sha256="b" * 64,
-            branch_kind="release",
-        )
-        with patch.object(
-            self.backend,
-            "release",
-            side_effect=ProtocolError("malformed private release"),
-        ) as release:
-            initial = asyncio.run(self.activities.release(value))
-            recovered = asyncio.run(self.activities.release(value))
-        assert release.call_count == 1
-        assert initial.payload == {"accepted": False, "protocol_failure": True}
-        assert recovered == initial
-        ledger = json.loads(Path(initial.artifact_path).read_bytes())
-        failure_path = Path(ledger["public_artifact_path"])
-        assert failure_path.read_bytes() == canonical_bytes(
-            {"accepted": False, "protocol_failure": True}
-        )
+        private_root = self.backend._artifacts.private_root
+        reason = "private rejection detail"
+        for endpoint, request_type in (("release", ReleaseRequest), ("g0_commit", G0CommitRequest)):
+            if endpoint == "g0_commit":
+                self.backend._artifacts = ArtifactStore.public_only(self.backend._artifacts.root)
+            value = request(
+                request_type,
+                workflow_id=endpoint,
+                run_id="run",
+                ordinal=0,
+                prior_record_sha256="0" * 64,
+                expected_revision_sha256="b" * 64,
+                branch_kind="canonical",
+            )
+            with patch.object(
+                self.backend, endpoint, side_effect=ProtocolError(reason)
+            ) as invocation:
+                execute = getattr(self.activities, endpoint)
+                initial = asyncio.run(execute(value))
+                recovered = asyncio.run(execute(value))
+            assert invocation.call_count == 1
+            assert initial.payload == {"accepted": False, "protocol_failure": True}
+            assert recovered == initial
+            ledger = json.loads(Path(initial.artifact_path).read_bytes())
+            failure_path = Path(ledger["public_artifact_path"])
+            assert failure_path.read_bytes() == canonical_bytes(
+                {"accepted": False, "protocol_failure": True}
+            )
+            relative = failure_path.relative_to(self.backend._artifacts.root)
+            log_path = private_root / relative.with_suffix("") / "trusted_logs.json"
+            if endpoint == "release":
+                assert json.loads(log_path.read_bytes())["reason"] == reason
+                assert log_path.stat().st_mode & 0o777 == 0o600
+            else:
+                assert not log_path.exists()
+            assert all(
+                reason not in path.read_text()
+                for path in self.backend._artifacts.root.rglob("*.json")
+            )
 
     def test_invalid_gate_publication_never_becomes_a_published_result(self) -> None:
         value = request(

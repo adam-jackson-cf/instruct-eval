@@ -210,6 +210,20 @@ class PrivateMapAuthority:
             raise ValueError("private map authority is malformed")
 
 
+@dataclass(frozen=True, slots=True)
+class DurableAuthoritySlots:
+    """Durable identities and source material for one child authority issuance."""
+
+    coordination: CoordinationStore
+    campaign_id: str
+    experiment_id: str
+    workflow_id: str
+    run_id: str
+    parent_workflow_id: str
+    parent_run_id: str
+    candidate_instruction: str
+
+
 class PrivateAuthorityResolver(Protocol):
     """Resolve configured private authority; never accept it from a request."""
 
@@ -295,9 +309,13 @@ class InstructEvalActivityBackend(ActivityBackend):
         self._subject_executor = subject_executor
         self._runtime = runtime
 
-    def _call(self, name: str, request: ActivityRequest) -> Any:
-        return getattr(self._operations, name)(
-            request, self._artifacts, self._coordination, self._runtime
+    async def _call(self, name: str, request: ActivityRequest) -> Any:
+        return await asyncio.to_thread(
+            getattr(self._operations, name),
+            request,
+            self._artifacts,
+            self._coordination,
+            self._runtime,
         )
 
     def fingerprint(self, request: FingerprintRequest) -> Any:
@@ -479,16 +497,18 @@ class InstructEvalActivityBackend(ActivityBackend):
             )
         issue = getattr(self._private_authority, "issue_from_durable_records", None)
         if activity_type == "instruct_eval.map_lifecycle" and callable(issue):
-            candidate_instruction = request.payload.get("candidate_instruction")
+            candidate_instruction = request.payload["candidate_instruction"]
             issue(
-                coordination=self._coordination,
-                campaign_id=request.campaign_id,
-                experiment_id=request.experiment_id,
-                workflow_id=workflow_id,
-                run_id=run_id,
-                parent_workflow_id=parent_workflow_id,
-                parent_run_id=parent_run_id,
-                candidate_instruction=candidate_instruction,
+                DurableAuthoritySlots(
+                    coordination=self._coordination,
+                    campaign_id=request.campaign_id,
+                    experiment_id=request.experiment_id,
+                    workflow_id=workflow_id,
+                    run_id=run_id,
+                    parent_workflow_id=parent_workflow_id,
+                    parent_run_id=parent_run_id,
+                    candidate_instruction=candidate_instruction,
+                )
             )
         authority = self._private_authority.authority_for(
             campaign_id=request.campaign_id,
@@ -705,16 +725,22 @@ class InstructEvalActivityBackend(ActivityBackend):
         if not isinstance(result, Mapping):
             raise TrialProtocolError("subject executor must return a closed outcome mapping")
         outcome = dict(result)
-        if set(outcome) != {
-            "blind_id",
-            "fixture",
-            "protocol_valid",
-            "verifier_passed",
-            "observer_state",
-            "direction_code",
-            "changed_paths",
-            "evidence_id",
-        }:
+        if outcome == {"protocol_valid": False}:
+            return outcome
+        if (
+            set(outcome)
+            != {
+                "blind_id",
+                "fixture",
+                "protocol_valid",
+                "verifier_passed",
+                "observer_state",
+                "direction_code",
+                "changed_paths",
+                "evidence_id",
+            }
+            or outcome["protocol_valid"] is not True
+        ):
             raise TrialProtocolError(
                 "subject executor did not return a closed de-identified outcome"
             )

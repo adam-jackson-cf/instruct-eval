@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
+import re
 import stat
 from collections.abc import Mapping
 from pathlib import Path
@@ -17,6 +19,38 @@ from .production import (
     run_private_production_worker,
     run_public_production_worker,
 )
+
+_SENSITIVE_DIAGNOSTIC = re.compile(
+    r"""\b(?:[a-z0-9]+[_-])*"""
+    r"""(?:token|evidence_key_hex|authorization|api[_-]?key|password|secret|activity_id)"""
+    r"""["']?\s*[:=]|subject-trial-|quarantine[/\\]|private[-_]artifacts[/\\]|"""
+    r"""(?<![a-z0-9_-])[a-z0-9_-]{43}(?![a-z0-9_-])""",
+    re.IGNORECASE,
+)
+
+
+def redact_diagnostics(value: str) -> str:
+    """Remove private-bearing lines before diagnostics reach an output stream."""
+    return "\n".join(
+        "[Redacted credential-bearing diagnostic line]"
+        if _SENSITIVE_DIAGNOSTIC.search(line)
+        else line
+        for line in value.split("\n")
+    )
+
+
+class _DiagnosticFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        message = redact_diagnostics(super().format(record))
+        return f"{record.levelname} {record.name}: {message}"
+
+
+def _configure_logging() -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(_DiagnosticFormatter())
+    logging.basicConfig(level=logging.WARNING, handlers=[handler])
+    if handler not in logging.getLogger().handlers:
+        raise ProductionConfigurationError("worker logging is already configured")
 
 
 def _secure_regular_file(path: Path, label: str) -> None:
@@ -107,6 +141,7 @@ def load_private_config(path: str | Path) -> ProductionConfig:
 
 
 def cli() -> None:
+    _configure_logging()
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("public", "private"))
     parser.add_argument("config")
