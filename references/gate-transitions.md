@@ -29,16 +29,15 @@ non-authorization completes at G6; it is not a protocol failure.
 
 ## Local Temporal preflight
 
-Before starting workers or creating campaign state, follow
-[Prepare local Temporal](../README.md#2-prepare-local-temporal) to provision the pinned CLI on first
-use, reuse the expected running service, or start a stopped service with its existing persistent
-SQLite database. An absent CLI or stopped service is normal preflight setup, not a missing control
-or treatment runtime.
+Before starting workers or creating campaign state, provision the pinned CLI on first use, reuse the
+expected running service, or start a stopped service with its existing persistent SQLite database.
+An absent CLI or stopped service is normal preflight setup, not a missing control or treatment
+runtime.
 
 Exit only when local Temporal at `127.0.0.1:7233` reports cluster health `SERVING` and namespace
 `instruct-eval` in state `Registered`. The database must be an absolute non-symlink `.sqlite` path
-outside ephemeral evaluation directories. Installation, startup, and readiness commands belong in
-the README; public/private worker boundaries remain in [artifact routing](artifact-routing.md).
+outside ephemeral evaluation directories. Public/private worker boundaries remain in
+[artifact routing](artifact-routing.md).
 
 ## Recovery
 

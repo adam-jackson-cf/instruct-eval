@@ -70,8 +70,6 @@ setup, not a missing control or treatment runtime.
 - Read: [local Temporal preflight](references/gate-transitions.md#local-temporal-preflight),
   [artifact routing](references/artifact-routing.md), and
   [artifact layout](references/artifact-layout.md).
-- Execute: [Prepare local Temporal](README.md#2-prepare-local-temporal) covers first installation,
-  readiness checks, and restarting a stopped service with its existing database.
 - Exit: local Temporal passes the referenced readiness checks, and both workers and durable stores
   satisfy the referenced routing and storage contracts.
 
